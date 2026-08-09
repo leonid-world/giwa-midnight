@@ -1,6 +1,21 @@
 {
-  "name": "giwa-midnight-cli",
+  "name": "zkloan-credit-scorer-cli",
   "version": "0.1.0",
+  "author": "Midnight Foundation",
+  "license": "Apache-2.0",
   "private": true,
-  "type": "module"
+  "type": "module",
+  "scripts": {
+    "preprod-remote": "node --experimental-specifier-resolution=node --loader ts-node/esm src/preprod-remote.ts",
+    "standalone": "node --experimental-specifier-resolution=node --loader ts-node/esm src/standalone.ts",
+    "test-api": "docker compose -f standalone.yml pull && DEBUG='testcontainers' vitest run",
+    "test-against-preprod": "RUN_ENV_TESTS=true TEST_ENV=preprod TEST_WALLET_SEED=1dec0dd58fbe4d3206ef960aebff95a77e09dffbd19f3e9439d23fe6de4fcdd1 vitest run",
+    "build": "rm -rf dist && tsc --project tsconfig.build.json",
+    "lint": "eslint src",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "start-preprod-remote": "npm run build && npm run preprod-remote"
+  },
+  "dependencies": {
+    "zkloan-credit-scorer-contract": "*"
+  }
 }

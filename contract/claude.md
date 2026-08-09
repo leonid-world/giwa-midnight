@@ -1,0 +1,446 @@
+# ZKLoan Credit Scorer — Contract Reference
+
+Reference for the Compact contract. Reflects `pragma language_version >= 0.22 && <= 0.23` and the Midnight toolchain 0.31.1 / ledger v8 build. **Caller identity is witness-derived throughout — `ownPublicKey()` is not called by this contract.** The admin role and per-user identity both derive from a single 32-byte `userSecretKey` in private state via domain-separated hashes.
+
+## Project Overview
+
+Privacy-preserving loan DApp on Midnight. Demonstrates:
+
+1. Processing sensitive financial data (credit score, income, tenure) privately via ZK proofs
+2. Verifying off-chain attestations with an in-circuit Schnorr signature on Jubjub before trusting the credit profile
+3. Storing only non-sensitive outcomes (loan status, approved amount) on the public ledger
+4. Managing a nested map of user loans on-chain
+5. Batched migration of a user's loans when they rotate their PIN
+
+---
+
+## Project Structure
+
+```
+zkloan-credit-scorer/
+├── contract/                          # Compact contract + TypeScript wrapper
+│   ├── src/
+│   │   ├── zkloan-credit-scorer.compact  # Main contract
+│   │   ├── schnorr.compact               # Schnorr verification polyfill (Jubjub)
+│   │   ├── index.ts                      # Re-exports contract + witnesses
+│   │   ├── witnesses.ts                  # TS witness implementations
+│   │   ├── managed/                      # Compiler output (generated)
+│   │   │   └── zkloan-credit-scorer/
+│   │   │       ├── contract/index.cjs    # Generated JS implementation
+│   │   │       ├── keys/                 # Proving / verifying keys
+│   │   │       └── zkir/                 # ZK intermediate representation
+│   │   └── test/
+│   │       ├── zkloan-credit-scorer.test.ts
+│   │       ├── zkloan-credit-scorer.simulator.ts
+│   │       └── utils/
+│   │           ├── address.ts
+│   │           └── test-data.ts          # Schnorr signing + user fixtures for tests
+│   └── package.json
+├── zkloan-credit-scorer-cli/          # CLI (deploy, join, loan flows, admin)
+├── zkloan-credit-scorer-ui/           # React + Vite frontend
+└── zkloan-credit-scorer-attestation-api/  # Restify service that signs credit data
+```
+
+---
+
+## Compact Contract Details
+
+### File: `contract/src/zkloan-credit-scorer.compact`
+
+**Language version**: `pragma language_version >= 0.22 && <= 0.23`
+
+### Types
+
+```compact
+export enum LoanStatus {
+    Approved,      // Approved outright, or accepted after a Proposed offer
+    Rejected,      // Applicant did not meet minimum tier eligibility
+    Proposed,      // Requested amount exceeded the user's eligible tier — awaiting user decision
+    NotAccepted,   // User declined a Proposed offer
+}
+
+export struct LoanApplication {
+    authorizedAmount: Uint<16>;
+    status: LoanStatus;
+}
+
+struct Applicant {  // private, not exported
+    creditScore: Uint<16>;
+    monthlyIncome: Uint<16>;
+    monthsAsCustomer: Uint<16>;
+}
+
+// From schnorr.compact, re-exported
+export struct SchnorrSignature {
+    announcement: JubjubPoint;
+    response: Field;
+}
+```
+
+### Ledger State
+
+| Variable | Type | Purpose |
+|---|---|---|
+| `blacklist` | `Set<UserPublicKey>` | Blocked derived user public keys (not wallet addresses) |
+| `loans` | `Map<Bytes<32>, Map<Uint<16>, LoanApplication>>` | User pubkey → loanId → loan |
+| `onGoingPinMigration` | `Map<Bytes<32>, Uint<16>>` | Tracks last migrated loanId per in-progress PIN change |
+| `contractAdmin` | `AdminPublicKey` | Derived public key of the current admin. The matching secret lives in private state; the admin proves possession inside the ZK circuit. Rotatable via `rotateAdmin`. |
+| `providers` | `Map<Uint<16>, JubjubPoint>` | Registered attestation provider public keys (Jubjub) |
+
+### Nested Map Access Pattern
+
+```compact
+// Outer map: derived userPubKey → inner map
+// Inner map: loanId → LoanApplication
+export ledger loans: Map<Bytes<32>, Map<Uint<16>, LoanApplication>>;
+
+// Initialize on first use
+if (!loans.member(userPk)) {
+    loans.insert(userPk, default<Map<Uint<16>, LoanApplication>>);
+}
+// Count
+const loanCount = loans.lookup(userPk).size();
+// Insert
+loans.lookup(userPk).insert(loanId, loan);
+```
+
+---
+
+## Circuits Reference
+
+### `requestLoan(amountRequested: Uint<16>, secretPin: Uint<16>): []`
+
+Entry point. Validates the caller, runs the private credit evaluation (which itself verifies an attestation signature), and records the outcome.
+
+```compact
+export circuit requestLoan(amountRequested: Uint<16>, secretPin: Uint<16>): [] {
+    assert(amountRequested > 0, "Loan amount must be greater than zero");
+    const requesterPubKey = deriveUserPublicKey(getUserSecret(), secretPin);
+    const disclosed = disclose(requesterPubKey);
+
+    assert(!blacklist.member(disclosed), "Requester is blacklisted");
+    assert(!onGoingPinMigration.member(disclosed as Bytes<32>),
+           "PIN migration is in progress for this user");
+
+    // Bound the signed attestation to this specific user identity
+    const userPubKeyHash = transientHash<Bytes<32>>(disclosed as Bytes<32>);
+
+    const [topTierAmount, status] = evaluateApplicant(userPubKeyHash);
+    createLoan(disclosed as Bytes<32>, amountRequested,
+               disclose(topTierAmount), disclose(status));
+}
+```
+
+The caller's identity comes from `deriveUserPublicKey(getUserSecret(), secretPin)` — the witness secret combined with the PIN, NOT from `ownPublicKey()`. The contract never consults the prover-claimed wallet pubkey.
+
+### `respondToLoan(loanId: Uint<16>, secretPin: Uint<16>, accept: Boolean): []`
+
+Resolves a `Proposed` loan. Only the loan owner (whose witness secret + PIN derive to the loan's storage key) can respond. Accepting flips status to `Approved` at the proposed amount; declining flips to `NotAccepted` with amount 0.
+
+### `evaluateApplicant(userPubKeyHash: Field): [Uint<16>, LoanStatus]`
+
+Private credit evaluation — runs off-chain as part of proof generation. Calls the `getAttestedScoringWitness` witness to pull the user's profile, signature, and provider id from local private state. Then:
+
+1. Asserts the provider is registered on-chain
+2. Looks up the provider's Jubjub public key
+3. Builds the signed message as `Vector<4, Field>` = `[creditScore, monthlyIncome, monthsAsCustomer, userPubKeyHash]`
+4. Runs `Schnorr_schnorrVerify<4>(msg, signature, providerPk)` — fails the whole transaction if the signature is invalid
+5. Applies the tier logic below
+
+```compact
+circuit evaluateApplicant(userPubKeyHash: Field): [Uint<16>, LoanStatus] {
+    const [profile, signature, providerId] = getAttestedScoringWitness();
+
+    assert(providers.member(disclose(providerId)), "Attestation provider not registered");
+    const providerPk = providers.lookup(disclose(providerId));
+
+    const msg: Vector<4, Field> = [
+        profile.creditScore as Field,
+        profile.monthlyIncome as Field,
+        profile.monthsAsCustomer as Field,
+        userPubKeyHash
+    ];
+    Schnorr_schnorrVerify<4>(msg, signature, providerPk);
+
+    // Tier 1: max $10,000
+    if (profile.creditScore >= 700 && profile.monthlyIncome >= 2000 && profile.monthsAsCustomer >= 24) {
+        return [10000, LoanStatus.Approved];
+    }
+    // Tier 2: max $7,000
+    else if (profile.creditScore >= 600 && profile.monthlyIncome >= 1500) {
+        return [7000, LoanStatus.Approved];
+    }
+    // Tier 3: max $3,000
+    else if (profile.creditScore >= 580) {
+        return [3000, LoanStatus.Approved];
+    }
+    else {
+        return [0, LoanStatus.Rejected];
+    }
+}
+```
+
+### `createLoan(requester, amountRequested, topTierAmount, status): []`
+
+Writes to the `loans` ledger. If `amountRequested > topTierAmount` the loan is stored with status `Proposed` (awaiting `respondToLoan`); otherwise the passed-through status is used.
+
+### `changePin(oldPin: Uint<16>, newPin: Uint<16>): []`
+
+Batched migration of a user's loans from `deriveUserPublicKey(getUserSecret(), oldPin)` to `deriveUserPublicKey(getUserSecret(), newPin)`. Fixed batch size of 5 per transaction. `onGoingPinMigration` records the last-migrated loanId so the DApp can call `changePin` repeatedly until all loans are moved.
+
+Key constraint: Compact circuits cannot iterate over variable-length collections, hence the fixed-size loop + off-chain orchestration.
+
+### `deriveUserPublicKey(sk: UserSecretKey, pin: Uint<16>): UserPublicKey`
+
+Deterministic per-user identity: `persistentHash(["zkloan:user:pk:v1", hash(pin), sk])`. Derived from the witness secret + PIN — never from `ownPublicKey()`. The PIN never appears on-chain; only the derived key does. Exported so the CLI/UI can compute the same value off-chain (loan-map lookups, blacklist targeting).
+
+### Admin Circuits
+
+All guarded by `assert(contractAdmin == deriveAdminPublicKey(getUserSecret()), ...)`. The admin holds a 32-byte `userSecretKey` in private state; the ledger stores only the derived admin public key. The equality check enforces, inside the ZK circuit, that the caller knows the preimage of `contractAdmin`. Any chain reader can copy the ledger value, but only the holder of the secret can satisfy the constraint.
+
+```compact
+export circuit blacklistUser(account: UserPublicKey): []
+export circuit removeBlacklistUser(account: UserPublicKey): []
+export circuit registerProvider(providerId: Uint<16>, providerPk: JubjubPoint): []
+export circuit removeProvider(providerId: Uint<16>): []
+export circuit rotateAdmin(newAdmin: AdminPublicKey): []
+```
+
+The `rotateAdmin` flow hands the role to a new admin without transmitting any private key. The new admin generates their own secret locally, calls `deriveAdminPublicKey` off-chain to compute their public key, and sends only the resulting 32-byte value to the current admin. The current admin submits `rotateAdmin(newAdmin)` to overwrite `contractAdmin` on the ledger.
+
+---
+
+## Attestation Signature Flow
+
+Credit data is signed off-chain by a registered provider and verified inside the ZK circuit. This prevents a malicious DApp from fabricating a high score client-side.
+
+1. Admin calls `registerProvider(id, pk)` with a Jubjub public key.
+2. A trusted service (see [zkloan-credit-scorer-attestation-api](../zkloan-credit-scorer-attestation-api)) signs `[creditScore, monthlyIncome, monthsAsCustomer, userPubKeyHash]` using Schnorr on Jubjub.
+3. The user stores the signature + providerId in their local private state.
+4. During `requestLoan`, the witness exposes the profile + signature + providerId. `evaluateApplicant` verifies the signature inside the circuit before applying the tier rules.
+
+Note: `JubjubPoint` is opaque in language 0.22 — coordinates must be read via `jubjubPointX(p)` / `jubjubPointY(p)`, not `.x` / `.y`. Point equality also can't use `==` directly (the compiler generates `===` which is JS reference equality); compare coordinates instead. See [schnorr.compact](src/schnorr.compact).
+
+---
+
+## TypeScript Witness Implementation
+
+File: [witnesses.ts](src/witnesses.ts)
+
+```typescript
+export type SchnorrSignature = {
+  announcement: { x: bigint; y: bigint };
+  response: bigint;
+};
+
+export type ZKLoanCreditScorerPrivateState = {
+  creditScore: bigint;
+  monthlyIncome: bigint;
+  monthsAsCustomer: bigint;
+  attestationSignature: SchnorrSignature;
+  attestationProviderId: bigint;
+  userSecretKey: Uint8Array;  // 32 bytes — the caller's authentic identity
+};
+
+export const witnesses = {
+  getAttestedScoringWitness: ({ privateState }) => [
+    privateState,
+    [
+      {
+        creditScore: privateState.creditScore,
+        monthlyIncome: privateState.monthlyIncome,
+        monthsAsCustomer: privateState.monthsAsCustomer,
+      },
+      privateState.attestationSignature,
+      privateState.attestationProviderId,
+    ],
+  ],
+
+  // Witness-assisted division of the challenge hash by 2^248 so the
+  // truncated challenge fits in the Jubjub scalar field.
+  getSchnorrReduction: ({ privateState }, challengeHash) => {
+    const q = challengeHash / TWO_248;
+    const r = challengeHash % TWO_248;
+    return [privateState, [q, r]];
+  },
+
+  // The single source of caller identity. The contract uses this to derive
+  // both per-user pubkeys (`deriveUserPublicKey`) and the admin pubkey
+  // (`deriveAdminPublicKey`). Validate the length so a malformed witness is
+  // rejected at proof time, not on-chain.
+  getUserSecret: ({ privateState }) => {
+    if (!privateState.userSecretKey || privateState.userSecretKey.length !== 32) {
+      throw new Error("userSecretKey is missing or wrong length");
+    }
+    return [privateState, privateState.userSecretKey];
+  },
+};
+```
+
+---
+
+## Testing
+
+### Simulator Pattern
+
+`src/test/zkloan-credit-scorer.simulator.ts` wraps the compiled contract. It generates a provider keypair in its constructor, builds an initial signed private state via `createSignedUserProfile`, and registers the provider so that `requestLoan` calls have a valid attestation to verify.
+
+### Example
+
+```typescript
+it("approves a Tier 1 loan, capping at the max amount", () => {
+  const sim = new ZKLoanCreditScorerSimulator();
+  const pin = 1234n;
+
+  sim.requestLoan(15000n, pin);  // over the tier 1 ceiling → Proposed
+
+  // The loan key is the caller's derived user pubkey (witness secret + PIN),
+  // not a wallet address — same value the contract computes in-circuit.
+  const loan = sim.getLedger().loans
+    .lookup(sim.deriveUserPublicKey(sim.userSecretKey, pin))
+    .lookup(1n);
+
+  expect(loan.status).toEqual(LoanStatus.Proposed);
+  expect(loan.authorizedAmount).toEqual(10000n);
+});
+```
+
+---
+
+## Commands
+
+### Contract
+
+```bash
+cd contract
+
+npm run compact       # compact compile — generates src/managed/
+npm run build         # tsc + copy managed/ into dist/
+npm test              # vitest
+npm run test:compile  # compact compile && vitest
+npm run lint
+```
+
+### CLI
+
+```bash
+cd zkloan-credit-scorer-cli
+
+npm run standalone       # against a local docker-compose network
+npm run testnet-remote   # against the remote testnet (needs WALLET_MNEMONIC + tDUST)
+npm run test-api         # docker-backed integration tests
+npm run build
+```
+
+---
+
+## Privacy Model
+
+### Private (never on-chain)
+
+- `creditScore`, `monthlyIncome`, `monthsAsCustomer` — stored in `ZKLoanCreditScorerPrivateState`, encrypted on disk by the level-private-state-provider
+- `secretPin` — never stored; only its hash contributes to the derived public key
+- The full attestation signature and the provider's choice (until the signature is verified in-circuit)
+- `userSecretKey` — single 32-byte secret per browser/CLI instance. Drives both the per-user identity (`deriveUserPublicKey(secret, pin)`) and the admin role (`deriveAdminPublicKey(secret)`). The deployer's derived admin pubkey is frozen into `contractAdmin`; everyone else's `getUserSecret()` produces a value whose hash does not match, so admin assertions fail for them. Domain separation keeps the per-user and admin pubkeys uncorrelated
+
+### Public (on the ledger)
+
+- Derived `userPubKey` (`Bytes<32>`) — unlinkable from the wallet's Zswap key without the PIN
+- `LoanStatus` and `authorizedAmount`
+- Blacklist entries
+- Registered provider ids + Jubjub public keys
+- `contractAdmin` (`AdminPublicKey`) — the admin's derived public key. The matching private secret is in the admin's local state
+
+### Leak Prevention
+
+1. All witness-derived data that reaches ledger operations goes through `disclose()` — otherwise the compiler rejects the write
+2. Credit evaluation is entirely off-chain; only the tier outcome is disclosed
+3. PIN is hashed into the public key; rotating the PIN yields a brand-new, unlinkable identity (hence the `changePin` migration logic)
+
+---
+
+## Network Configurations
+
+| Config | Indexer | Node | NetworkId | Use |
+|---|---|---|---|---|
+| Standalone | `http://localhost:8088` | `ws://localhost:9944` | Undeployed | Local docker-compose (see [standalone.yml](../zkloan-credit-scorer-cli/standalone.yml)) |
+| TestnetLocal | `http://localhost:8088` | `ws://localhost:9944` | TestNet | Local proof server + remote testnet |
+| Preprod | `https://indexer.preprod.midnight.network/api/v4/graphql` | `wss://rpc.preprod.midnight.network` | Preprod | Public preprod testnet |
+
+---
+
+## Common Compact Patterns in This Project
+
+### Access control
+```compact
+// Witness-derived keypair pattern. The admin proves knowledge of the secret
+// whose hash is stored in `contractAdmin`. `ownPublicKey()` is never called
+// in this contract — it returns a value the prover claims and any assertion
+// that depends on it is bypassable, even for blacklist or identity checks.
+assert(contractAdmin == deriveAdminPublicKey(getUserSecret()), "Only admin can blacklist users");
+```
+
+### Nested map init
+```compact
+if (!loans.member(requester)) {
+    loans.insert(requester, default<Map<Uint<16>, LoanApplication>>);
+}
+```
+
+### Auto-incrementing IDs
+```compact
+const loanNumber = (loans.lookup(requester).size() + 1) as Uint<16>;
+```
+
+### Blocking during migration
+```compact
+assert(!onGoingPinMigration.member(userPk), "PIN migration in progress");
+```
+
+### Fixed-size batch
+```compact
+for (const i of 0..5) {  // compile-time constant
+    if (condition) { ... }
+}
+```
+
+### JubjubPoint (0.22)
+```compact
+// Access coords via circuits, not .x / .y
+const x: Field = jubjubPointX(point);
+const y: Field = jubjubPointY(point);
+
+// Equality: compare coords, not the whole point — the compiler emits `===`
+// which is JS reference equality on the opaque object
+assert(jubjubPointX(lhs) == jubjubPointX(rhs) &&
+       jubjubPointY(lhs) == jubjubPointY(rhs),
+       "points not equal");
+```
+
+---
+
+## Known Limitations
+
+1. Batch size for `changePin` is hardcoded at 5 per transaction
+2. No loan repayment / settlement tracking — the contract models only application + response
+3. A single provider signs the attestation; no multi-provider threshold or rotation of signed payload format
+4. The attestation API is a demo-grade signer; in production it would need HSM-backed key custody and access control
+
+---
+
+## Dependencies
+
+### Contract
+- `@midnight-ntwrk/compact-runtime` — runtime for generated JS
+- `vitest` — tests
+
+### CLI
+- `@midnight-ntwrk/midnight-js-contracts` — deploy / find / submit
+- `@midnight-ntwrk/midnight-js-level-private-state-provider` — encrypted on-disk private state
+- `@midnight-ntwrk/midnight-js-http-client-proof-provider` — proof server client
+- `@midnight-ntwrk/midnight-js-indexer-public-data-provider` — ledger state reads
+- `@midnight-ntwrk/midnight-js-node-zk-config-provider` — serves prover / verifier keys
+- `@midnight-ntwrk/wallet-sdk-facade`, `@midnight-ntwrk/wallet-sdk-shielded`, `@midnight-ntwrk/wallet-sdk-unshielded-wallet`, `@midnight-ntwrk/wallet-sdk-dust-wallet`, `@midnight-ntwrk/wallet-sdk-hd` — wallet construction + balancing
+- `@midnight-ntwrk/ledger-v8` — ledger types (addresses, fees, tx structures)
+- `pino` — logger
+- `testcontainers` — docker-driven tests

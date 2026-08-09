@@ -9,6 +9,10 @@ this repository and remain unchanged during CLI-first phases.
 
 ## Workspaces
 
+Use Node 22 (`nvm use`) for the official ZK Loan runtime. Node 24 is installed
+locally but is incompatible with the official Attestation API's current
+Restify/SPDY dependency path.
+
 - `contract/`: Compact contract and generated artifacts
 - `api/`: future shared TypeScript boundary; no Spring Boot replacement
 - `cli/`: local wallet, private state, proof, deployment, and state-query flow

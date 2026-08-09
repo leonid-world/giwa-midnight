@@ -15,6 +15,7 @@
   "devDependencies": {
     "@types/node": "^25.0.1",
     "@types/ws": "^8.18.1",
+    "testcontainers": "^11.10.0",
     "ts-node": "^10.9.2",
     "typescript": "^5.9.3",
     "vitest": "^4.0.15"
