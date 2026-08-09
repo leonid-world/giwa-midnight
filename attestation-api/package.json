@@ -1,0 +1,6 @@
+{
+  "name": "giwa-midnight-attestation-api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module"
+}
