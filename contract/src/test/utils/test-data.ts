@@ -1,184 +1,119 @@
-// This file is part of the ZKLoan Credit Scorer example.
+// This file is derived from the Midnight ZK Loan example test utilities.
 // Copyright (C) 2025 Midnight Foundation
 // SPDX-License-Identifier: Apache-2.0
 
-import { type ZKLoanCreditScorerPrivateState } from '../../witnesses.js';
+import { type GasokEligibilityPrivateState } from '../../witnesses.js';
 import { pureCircuits, type Schnorr_SchnorrSignature } from '../../managed/zkloan-credit-scorer/contract/index.js';
 import { ecMulGenerator, type JubjubPoint } from '@midnight-ntwrk/midnight-js-protocol/compact-runtime';
 import * as crypto from 'crypto';
 
-export const userProfiles = [
+export const financialProfiles = [
   {
-    applicantId: 'user-001',
-    creditScore: 720,
-    monthlyIncome: 2500,
-    monthsAsCustomer: 24,
+    profileId: 'eligible-boundary',
+    annualRevenueKrw: 500000000n,
+    debtRatioBps: 20000n,
+    overdueCount: 1n,
   },
   {
-    applicantId: 'user-002',
-    creditScore: 650,
-    monthlyIncome: 1800,
-    monthsAsCustomer: 11,
+    profileId: 'eligible-comfortable',
+    annualRevenueKrw: 1200000000n,
+    debtRatioBps: 12500n,
+    overdueCount: 0n,
   },
   {
-    applicantId: 'user-003',
-    creditScore: 580,
-    monthlyIncome: 2200,
-    monthsAsCustomer: 36,
+    profileId: 'ineligible-revenue',
+    annualRevenueKrw: 499999999n,
+    debtRatioBps: 20000n,
+    overdueCount: 1n,
   },
   {
-    applicantId: 'user-004',
-    creditScore: 710,
-    monthlyIncome: 1900,
-    monthsAsCustomer: 5,
+    profileId: 'ineligible-debt',
+    annualRevenueKrw: 500000000n,
+    debtRatioBps: 20001n,
+    overdueCount: 1n,
   },
   {
-    applicantId: 'user-005',
-    creditScore: 520,
-    monthlyIncome: 3000,
-    monthsAsCustomer: 48,
+    profileId: 'ineligible-overdue',
+    annualRevenueKrw: 500000000n,
+    debtRatioBps: 20000n,
+    overdueCount: 2n,
   },
-  {
-    applicantId: 'user-006',
-    creditScore: 810,
-    monthlyIncome: 4500,
-    monthsAsCustomer: 60,
-  },
-  {
-    applicantId: 'user-007',
-    creditScore: 639,
-    monthlyIncome: 2100,
-    monthsAsCustomer: 18,
-  },
-  {
-    applicantId: 'user-008',
-    creditScore: 680,
-    monthlyIncome: 1450,
-    monthsAsCustomer: 30,
-  },
-  {
-    applicantId: 'user-009',
-    creditScore: 750,
-    monthlyIncome: 2100,
-    monthsAsCustomer: 23,
-  },
-  {
-    applicantId: 'user-010',
-    creditScore: 579,
-    monthlyIncome: 1900,
-    monthsAsCustomer: 12,
-  },
-];
+] as const;
 
-// Jubjub curve order for scalar field
 const JUBJUB_ORDER = 6554484396890773809930967563523245729705921265872317281365359162392183254199n;
+const TWO_248 = 452312848583266388373324160190187140051835877600158453279131187530910662656n;
 
 function randomScalar(): bigint {
   const bytes = crypto.randomBytes(32);
-  let val = BigInt('0x' + bytes.toString('hex'));
-  return val % JUBJUB_ORDER;
+  const value = BigInt(`0x${bytes.toString('hex')}`);
+  return value % JUBJUB_ORDER;
 }
 
 export function generateProviderKeyPair(): { sk: bigint; pk: JubjubPoint } {
   const sk = randomScalar();
-  const pk = ecMulGenerator(sk);
-  return { sk, pk };
+  return { sk, pk: ecMulGenerator(sk) };
 }
-
-const TWO_248 = 452312848583266388373324160190187140051835877600158453279131187530910662656n;
 
 export function schnorrSign(sk: bigint, msg: bigint[]): Schnorr_SchnorrSignature {
   const pk = ecMulGenerator(sk);
-  const k = randomScalar();
-  const R = ecMulGenerator(k);
-  // pureCircuits.schnorrChallenge returns the full transientHash output.
-  // The circuit truncates it to 248 bits (mod 2^248) before using in EC ops.
-  const cFull = pureCircuits.schnorrChallenge(R.x, R.y, pk.x, pk.y, msg);
-  const c = cFull % TWO_248;
-  // Compute response: s = (k + c * sk) mod JUBJUB_ORDER
-  // We must reduce mod JUBJUB_ORDER (not BLS12-381 Fr) because ecMulGenerator
-  // requires scalars < JUBJUB_ORDER.
-  const s = (((k + c * sk) % JUBJUB_ORDER) + JUBJUB_ORDER) % JUBJUB_ORDER;
-  return { announcement: R, response: s };
+  const nonce = randomScalar();
+  const announcement = ecMulGenerator(nonce);
+  const challengeFull = pureCircuits.schnorrChallenge(
+    announcement.x,
+    announcement.y,
+    pk.x,
+    pk.y,
+    msg,
+  );
+  const challenge = challengeFull % TWO_248;
+  const response = (((nonce + challenge * sk) % JUBJUB_ORDER) + JUBJUB_ORDER) % JUBJUB_ORDER;
+  return { announcement, response };
 }
 
-export function generateUserSecret(): Uint8Array {
+export function generateCompanySecret(): Uint8Array {
   return new Uint8Array(crypto.randomBytes(32));
 }
 
-export function createSignedUserProfile(
+export function createSignedFinancialProfile(
+  annualRevenueKrw: bigint,
+  debtRatioBps: bigint,
+  overdueCount: bigint,
+  providerSk: bigint,
+  companyCommitmentHash: bigint,
+  providerId: bigint = 1n,
+  companySecretKey: Uint8Array = generateCompanySecret(),
+): GasokEligibilityPrivateState {
+  const message = [annualRevenueKrw, debtRatioBps, overdueCount, companyCommitmentHash];
+
+  return {
+    annualRevenueKrw,
+    debtRatioBps,
+    overdueCount,
+    attestationSignature: schnorrSign(providerSk, message),
+    attestationProviderId: providerId,
+    companySecretKey,
+  };
+}
+
+export function createSignedFinancialProfileFromFixture(
   index: number,
   providerSk: bigint,
-  userPubKeyHash: bigint,
+  companyCommitmentHash: bigint,
   providerId: bigint = 1n,
-  userSecretKey: Uint8Array = generateUserSecret(),
-): ZKLoanCreditScorerPrivateState {
-  const profile = userProfiles[index];
+  companySecretKey: Uint8Array = generateCompanySecret(),
+): GasokEligibilityPrivateState {
+  const profile = financialProfiles[index];
   if (!profile) {
-    throw new Error(`Index ${index} is out of bounds. Must be between 0 and ${userProfiles.length - 1}.`);
+    throw new Error(`Index ${index} is out of bounds. Must be between 0 and ${financialProfiles.length - 1}.`);
   }
 
-  const msg: bigint[] = [
-    BigInt(profile.creditScore),
-    BigInt(profile.monthlyIncome),
-    BigInt(profile.monthsAsCustomer),
-    userPubKeyHash,
-  ];
-
-  const signature = schnorrSign(providerSk, msg);
-
-  return {
-    creditScore: BigInt(profile.creditScore),
-    monthlyIncome: BigInt(profile.monthlyIncome),
-    monthsAsCustomer: BigInt(profile.monthsAsCustomer),
-    attestationSignature: signature,
-    attestationProviderId: providerId,
-    userSecretKey,
-  };
-}
-
-export function createCustomSignedProfile(
-  creditScore: bigint,
-  monthlyIncome: bigint,
-  monthsAsCustomer: bigint,
-  providerSk: bigint,
-  userPubKeyHash: bigint,
-  providerId: bigint = 1n,
-  userSecretKey: Uint8Array = generateUserSecret(),
-): ZKLoanCreditScorerPrivateState {
-  const msg: bigint[] = [creditScore, monthlyIncome, monthsAsCustomer, userPubKeyHash];
-  const signature = schnorrSign(providerSk, msg);
-
-  return {
-    creditScore,
-    monthlyIncome,
-    monthsAsCustomer,
-    attestationSignature: signature,
-    attestationProviderId: providerId,
-    userSecretKey,
-  };
-}
-
-export function getUserProfile(
-  index?: number,
-  userSecretKey: Uint8Array = generateUserSecret(),
-): ZKLoanCreditScorerPrivateState {
-  let profile;
-  if (index !== undefined) {
-    if (index < 0 || index >= userProfiles.length) {
-      throw new Error(`Index ${index} is out of bounds. Must be between 0 and ${userProfiles.length - 1}.`);
-    }
-    profile = userProfiles[index];
-  } else {
-    const randomIndex = Math.floor(Math.random() * userProfiles.length);
-    profile = userProfiles[randomIndex];
-  }
-  return {
-    creditScore: BigInt(profile.creditScore),
-    monthlyIncome: BigInt(profile.monthlyIncome),
-    monthsAsCustomer: BigInt(profile.monthsAsCustomer),
-    attestationSignature: { announcement: { x: 0n, y: 0n }, response: 0n },
-    attestationProviderId: 0n,
-    userSecretKey,
-  };
+  return createSignedFinancialProfile(
+    profile.annualRevenueKrw,
+    profile.debtRatioBps,
+    profile.overdueCount,
+    providerSk,
+    companyCommitmentHash,
+    providerId,
+    companySecretKey,
+  );
 }

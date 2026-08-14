@@ -28,3 +28,9 @@ implementation or observed runtime behavior rather than presenting theory alone.
 - Keep provider private keys, mnemonics, raw financial inputs, signatures, and
   local private state out of Git, logs, MySQL, and public ledger state.
 - Expose only commitments and eligibility outputs publicly.
+
+## Change Visibility
+
+At the end of every task, report this repository's `git status --short --branch`
+and tell the owner that the parent GASOK repository records only this
+submodule's commit pointer.

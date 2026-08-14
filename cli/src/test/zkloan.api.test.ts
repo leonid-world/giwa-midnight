@@ -16,20 +16,20 @@
 import path from 'path';
 import * as api from '../api';
 import type { WalletContext } from '../api';
-import { type ZKLoanCreditScorerProviders } from '../common-types';
+import { type GasokEligibilityProviders } from '../common-types';
 import { currentDir } from '../config';
 import { createLogger } from '../logger-utils';
 import { TestEnvironment } from './commons';
-import { getUserProfile } from '../state.utils';
+import { getInitialPrivateState } from '../state.utils';
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 
 const logDir = path.resolve(currentDir, '..', 'logs', 'tests', `${new Date().toISOString()}.log`);
 const logger = await createLogger(logDir);
 
-describe('ZKLoan Credit Scorer API', () => {
+describe('GASOK Financial Eligibility API', () => {
   let testEnvironment: TestEnvironment;
   let walletContext: WalletContext;
-  let providers: ZKLoanCreditScorerProviders;
+  let providers: GasokEligibilityProviders;
 
   beforeAll(
     async () => {
@@ -48,28 +48,32 @@ describe('ZKLoan Credit Scorer API', () => {
 
   // Skipped: requires a running attestation API (see zkloan-credit-scorer-attestation-api)
   // and registered provider on-chain. The deploy + ledger-read portion still works.
-  it.skip('should deploy the contract and request a loan [@slow]', async () => {
-    // Deploy with a Tier 1 user profile
-    const userProfile = getUserProfile(0); // user-001: credit 720, income 2500, tenure 24
-    const contract = await api.deploy(providers, userProfile);
+  it.skip('should deploy the contract and verify eligibility [@slow]', async () => {
+    const contract = await api.deploy(providers, getInitialPrivateState());
     expect(contract).not.toBeNull();
 
     // Check initial state
     const initialState = await api.displayContractState(providers, contract);
     expect(initialState.ledgerState).not.toBeNull();
 
-    // Request a loan
     await new Promise((resolve) => setTimeout(resolve, 2000));
     const secretPin = 1234n;
-    const amountRequested = 5000n;
 
     const attestationApiUrl = process.env.ATTESTATION_API_URL ?? 'http://localhost:4000';
 
-    const response = await api.requestLoan(contract, providers, amountRequested, secretPin, attestationApiUrl);
+    const response = await api.verifyEligibility(
+      contract,
+      providers,
+      500_000_000n,
+      20_000n,
+      1n,
+      secretPin,
+      attestationApiUrl,
+    );
     expect(response.txId).toMatch(/[0-9a-f]{64}/);
     expect(response.blockHeight).toBeGreaterThan(BigInt(0));
 
-    // Verify the loan was created
+    // Verify the public result state is queryable.
     const stateAfter = await api.displayContractState(providers, contract);
     expect(stateAfter.contractAddress).toEqual(initialState.contractAddress);
   });

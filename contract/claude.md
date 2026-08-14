@@ -1,3 +1,10 @@
+# Archived Phase 1 ZK Loan Reference
+
+This file documents the unchanged official example reproduced during Phase 1.
+It is not the current GASOK Phase 2 specification. The active contract now
+implements binary financial eligibility in `src/zkloan-credit-scorer.compact`;
+see the workspace README and GASOK root `docs/ai/MIDNIGHT.md` for current rules.
+
 # ZKLoan Credit Scorer — Contract Reference
 
 Reference for the Compact contract. Reflects `pragma language_version >= 0.22 && <= 0.23` and the Midnight toolchain 0.31.1 / ledger v8 build. **Caller identity is witness-derived throughout — `ownPublicKey()` is not called by this contract.** The admin role and per-user identity both derive from a single 32-byte `userSecretKey` in private state via domain-separated hashes.

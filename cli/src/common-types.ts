@@ -13,30 +13,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import { ZKLoanCreditScorer, type ZKLoanCreditScorerPrivateState } from 'zkloan-credit-scorer-contract';
+import { GasokEligibility, type GasokEligibilityPrivateState } from 'zkloan-credit-scorer-contract';
 import type { MidnightProviders } from '@midnight-ntwrk/midnight-js-types';
 import type { DeployedContract, FoundContract } from '@midnight-ntwrk/midnight-js-contracts';
 
-export type ZKLoanCreditScorerCircuits =
-  | 'requestLoan'
-  | 'changePin'
-  | 'blacklistUser'
-  | 'removeBlacklistUser'
+export type GasokEligibilityCircuits =
+  | 'verifyEligibility'
   | 'rotateAdmin'
-  | 'respondToLoan'
   | 'registerProvider'
   | 'removeProvider';
 
-export const ZKLoanCreditScorerPrivateStateId = 'zkLoanCreditScorerPrivateState';
+export const GasokEligibilityPrivateStateId = 'gasokEligibilityPrivateState';
 
-export type ZKLoanCreditScorerProviders = MidnightProviders<
-  ZKLoanCreditScorerCircuits,
-  typeof ZKLoanCreditScorerPrivateStateId,
-  ZKLoanCreditScorerPrivateState
+export type GasokEligibilityProviders = MidnightProviders<
+  GasokEligibilityCircuits,
+  typeof GasokEligibilityPrivateStateId,
+  GasokEligibilityPrivateState
 >;
 
-export type ZKLoanCreditScorerContract = ZKLoanCreditScorer.Contract<ZKLoanCreditScorerPrivateState>;
+export type GasokEligibilityContract = GasokEligibility.Contract<GasokEligibilityPrivateState>;
 
-export type DeployedZKLoanCreditScorerContract =
-  | DeployedContract<ZKLoanCreditScorerContract>
-  | FoundContract<ZKLoanCreditScorerContract>;
+export type DeployedGasokEligibilityContract =
+  | DeployedContract<GasokEligibilityContract>
+  | FoundContract<GasokEligibilityContract>;

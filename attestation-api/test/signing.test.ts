@@ -1,9 +1,9 @@
 import { describe, it, expect } from 'vitest';
 import { setNetworkId } from '@midnight-ntwrk/midnight-js-network-id';
-import { sign, generateKeyPair, signCreditData } from '../src/signing.js';
+import { sign, generateKeyPair, signFinancialData } from '../src/signing.js';
 import { ecMulGenerator, ecMul, ecAdd } from '@midnight-ntwrk/midnight-js-protocol/compact-runtime';
-import { ZKLoanCreditScorer } from 'zkloan-credit-scorer-contract';
-const { pureCircuits } = ZKLoanCreditScorer;
+import { GasokEligibility } from 'zkloan-credit-scorer-contract';
+const { pureCircuits } = GasokEligibility;
 
 setNetworkId('undeployed');
 
@@ -51,14 +51,14 @@ describe('Schnorr signing', () => {
     expect(sig1.response).not.toEqual(sig2.response);
   });
 
-  it('signCreditData produces valid signature for credit data', () => {
+  it('signFinancialData signs GASOK fields in contract order', () => {
     const { sk, pk } = generateKeyPair();
-    const userPubKeyHash = 12345678901234567890n;
+    const companyCommitmentHash = 12345678901234567890n;
 
-    const sig = signCreditData(sk, 720, 2500, 24, userPubKeyHash);
+    const sig = signFinancialData(sk, 500_000_000n, 20_000n, 1n, companyCommitmentHash);
 
     // Verify manually
-    const msg = [720n, 2500n, 24n, userPubKeyHash];
+    const msg: [bigint, bigint, bigint, bigint] = [500_000_000n, 20_000n, 1n, companyCommitmentHash];
     const cFull = pureCircuits.schnorrChallenge(
       sig.announcement.x, sig.announcement.y,
       pk.x, pk.y,

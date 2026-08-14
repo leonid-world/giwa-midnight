@@ -1,44 +1,54 @@
 import restify from 'restify';
-import { signCreditData, getPublicKey } from './signing.js';
+import { MAX_FIELD, type JubjubPoint } from '@midnight-ntwrk/midnight-js-protocol/compact-runtime';
+import { signFinancialData, getPublicKey } from './signing.js';
 import type { AttestationRequest, AttestationResponse, ProviderInfoResponse, HealthResponse } from './types.js';
-import type { JubjubPoint } from '@midnight-ntwrk/midnight-js-protocol/compact-runtime';
+
+const UINT16_MAX = (1n << 16n) - 1n;
+const UINT32_MAX = (1n << 32n) - 1n;
+const UINT64_MAX = (1n << 64n) - 1n;
+
+class RequestValidationError extends Error {}
+
+function parseDecimalString(value: unknown, fieldName: string, maximum: bigint): bigint {
+  if (typeof value !== 'string' || !/^(0|[1-9][0-9]*)$/.test(value)) {
+    throw new RequestValidationError(`${fieldName} must be an unsigned decimal string`);
+  }
+
+  const parsed = BigInt(value);
+  if (parsed > maximum) {
+    throw new RequestValidationError(`${fieldName} is outside its supported range`);
+  }
+  return parsed;
+}
 
 export function createServer(providerSk: bigint, providerId: number): restify.Server {
-  const server = restify.createServer({ name: 'zkloan-attestation-api' });
-  server.use(restify.plugins.bodyParser());
+  if (!Number.isInteger(providerId) || providerId < 0 || BigInt(providerId) > UINT16_MAX) {
+    throw new Error('Mock attestation provider ID must fit Uint<16>');
+  }
 
-  // CORS support for browser-based UI
-  server.pre((req: restify.Request, res: restify.Response, next: restify.Next) => {
-    res.header('Access-Control-Allow-Origin', '*');
-    res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.header('Access-Control-Allow-Headers', 'Content-Type');
-    if (req.method === 'OPTIONS') {
-      res.send(204);
-      return next(false);
-    }
-    return next();
-  });
+  const server = restify.createServer({ name: 'gasok-mock-attestation-api' });
+  server.use(restify.plugins.bodyParser());
 
   const providerPk: JubjubPoint = getPublicKey(providerSk);
 
   server.post('/attest', (req: restify.Request, res: restify.Response, next: restify.Next) => {
     try {
-      const body = req.body as AttestationRequest;
+      const body = (req.body ?? {}) as Partial<AttestationRequest>;
+      const annualRevenueKrw = parseDecimalString(body.annualRevenueKrw, 'annualRevenueKrw', UINT64_MAX);
+      const debtRatioBps = parseDecimalString(body.debtRatioBps, 'debtRatioBps', UINT32_MAX);
+      const overdueCount = parseDecimalString(body.overdueCount, 'overdueCount', UINT16_MAX);
+      const companyCommitmentHash = parseDecimalString(
+        body.companyCommitmentHash,
+        'companyCommitmentHash',
+        MAX_FIELD,
+      );
 
-      if (body.creditScore == null || body.monthlyIncome == null ||
-          body.monthsAsCustomer == null || body.userPubKeyHash == null) {
-        res.send(400, { error: 'Missing required fields: creditScore, monthlyIncome, monthsAsCustomer, userPubKeyHash' });
-        return next();
-      }
-
-      const userPubKeyHash = BigInt(body.userPubKeyHash);
-
-      const signature = signCreditData(
+      const signature = signFinancialData(
         providerSk,
-        body.creditScore,
-        body.monthlyIncome,
-        body.monthsAsCustomer,
-        userPubKeyHash,
+        annualRevenueKrw,
+        debtRatioBps,
+        overdueCount,
+        companyCommitmentHash,
       );
 
       const response: AttestationResponse = {
@@ -49,17 +59,17 @@ export function createServer(providerSk: bigint, providerId: number): restify.Se
           },
           response: signature.response.toString(),
         },
-        message: {
-          creditScore: body.creditScore.toString(),
-          monthlyIncome: body.monthlyIncome.toString(),
-          monthsAsCustomer: body.monthsAsCustomer.toString(),
-          userPubKeyHash: userPubKeyHash.toString(),
-        },
+        providerId,
+        attestationType: 'mock',
       };
 
       res.send(200, response);
-    } catch (err: any) {
-      res.send(500, { error: err.message });
+    } catch (err: unknown) {
+      if (err instanceof RequestValidationError) {
+        res.send(400, { error: err.message });
+      } else {
+        res.send(500, { error: 'Mock attestation signing failed' });
+      }
     }
     return next();
   });
@@ -71,6 +81,7 @@ export function createServer(providerSk: bigint, providerId: number): restify.Se
         x: providerPk.x.toString(),
         y: providerPk.y.toString(),
       },
+      attestationType: 'mock',
     };
     res.send(200, response);
     return next();
@@ -80,6 +91,7 @@ export function createServer(providerSk: bigint, providerId: number): restify.Se
     const response: HealthResponse = {
       status: 'ok',
       providerId,
+      attestationType: 'mock',
     };
     res.send(200, response);
     return next();

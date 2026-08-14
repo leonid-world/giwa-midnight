@@ -17,11 +17,11 @@ import { stdin as input, stdout as output } from 'node:process';
 import { createInterface, type Interface } from 'node:readline/promises';
 import { type Logger } from 'pino';
 import { type StartedDockerComposeEnvironment, type DockerComposeEnvironment } from 'testcontainers';
-import { type ZKLoanCreditScorerProviders, type DeployedZKLoanCreditScorerContract } from './common-types';
+import { type GasokEligibilityProviders, type DeployedGasokEligibilityContract } from './common-types';
 import { type Config, StandaloneConfig } from './config';
 import * as api from './api';
 import type { WalletContext } from './api';
-import { getUserProfile } from './state.utils';
+import { getInitialPrivateState } from './state.utils';
 import 'dotenv/config';
 
 let logger: Logger;
@@ -34,42 +34,39 @@ const GENESIS_MINT_WALLET_SEED = '0000000000000000000000000000000000000000000000
 
 const DEPLOY_OR_JOIN_QUESTION = `
 You can do one of the following:
-  1. Deploy a new ZKLoan Credit Scorer contract
-  2. Join an existing ZKLoan Credit Scorer contract
+  1. Deploy a new GASOK Financial Eligibility contract
+  2. Join an existing GASOK Financial Eligibility contract
   3. Exit
 Which would you like to do? `;
 
 const MAIN_LOOP_QUESTION = `
 You can do one of the following:
-  1. Request a loan
-  2. Change PIN
-  3. Display contract state
-  4. Display wallet balances
-  5. [Admin] Blacklist a user
-  6. [Admin] Remove user from blacklist
-  7. [Admin] Rotate admin role to new derived public key
-  8. [Admin] Register attestation provider
-  9. [Admin] Remove attestation provider
-  10. Exit
+  1. Verify GASOK financial eligibility
+  2. Display public contract state
+  3. Display wallet balances
+  4. [Admin] Rotate admin role to new derived public key
+  5. [Admin] Register Mock Attestation Provider
+  6. [Admin] Remove Mock Attestation Provider
+  7. Exit
 Which would you like to do? `;
 
 const join = async (
-  providers: ZKLoanCreditScorerProviders,
+  providers: GasokEligibilityProviders,
   rli: Interface,
-): Promise<DeployedZKLoanCreditScorerContract> => {
+): Promise<DeployedGasokEligibilityContract> => {
   const contractAddress = await rli.question('What is the contract address (in hex)? ');
   return await api.joinContract(providers, contractAddress);
 };
 
 const deployOrJoin = async (
-  providers: ZKLoanCreditScorerProviders,
+  providers: GasokEligibilityProviders,
   rli: Interface,
-): Promise<DeployedZKLoanCreditScorerContract | null> => {
+): Promise<DeployedGasokEligibilityContract | null> => {
   while (true) {
     const choice = await rli.question(DEPLOY_OR_JOIN_QUESTION);
     switch (choice) {
       case '1':
-        return await api.deploy(providers, getUserProfile());
+        return await api.deploy(providers, getInitialPrivateState());
       case '2':
         return await join(providers, rli);
       case '3':
@@ -81,72 +78,47 @@ const deployOrJoin = async (
   }
 };
 
-const requestLoan = async (
-  contract: DeployedZKLoanCreditScorerContract,
-  providers: ZKLoanCreditScorerProviders,
-  _walletContext: WalletContext,
+const parseUint = (input: string, label: string, max: bigint): bigint => {
+  const value = input.trim();
+  if (!/^\d+$/.test(value)) {
+    throw new Error(`${label} must be a non-negative integer.`);
+  }
+  const parsed = BigInt(value);
+  if (parsed > max) {
+    throw new Error(`${label} exceeds the supported range.`);
+  }
+  return parsed;
+};
+
+const verifyEligibilityFlow = async (
+  contract: DeployedGasokEligibilityContract,
+  providers: GasokEligibilityProviders,
   rli: Interface,
 ): Promise<void> => {
-  const amountStr = await rli.question(
-    'Enter the loan amount (USD, 1-65535 — the contract caps approvals at $10,000 / $7,000 / $3,000 per tier): ',
-  );
+  const annualRevenueKrwStr = await rli.question('Enter annual revenue in integer KRW: ');
+  const debtRatioBpsStr = await rli.question('Enter debt ratio in basis points (200.00% = 20000): ');
+  const overdueCountStr = await rli.question('Enter overdue count: ');
   const pinStr = await rli.question('Enter your secret PIN: ');
 
-  const amount = BigInt(amountStr);
-  const pin = BigInt(pinStr);
+  const annualRevenueKrw = parseUint(annualRevenueKrwStr, 'Annual revenue', (1n << 64n) - 1n);
+  const debtRatioBps = parseUint(debtRatioBpsStr, 'Debt ratio', (1n << 32n) - 1n);
+  const overdueCount = parseUint(overdueCountStr, 'Overdue count', (1n << 16n) - 1n);
+  const pin = parseUint(pinStr, 'PIN', (1n << 16n) - 1n);
 
   const attestationApiUrl = process.env.ATTESTATION_API_URL || 'http://localhost:4000';
 
-  // The caller's identity is derived from the local `userSecretKey` in
-  // private state — read by `api.requestLoan` directly. The wallet's Zswap
-  // key is not part of the contract's identity model.
-  await api.requestLoan(contract, providers, amount, pin, attestationApiUrl);
-  logger.info('Loan request submitted successfully!');
-};
-
-const changePinFlow = async (contract: DeployedZKLoanCreditScorerContract, rli: Interface): Promise<void> => {
-  const oldPinStr = await rli.question('Enter your old PIN: ');
-  const newPinStr = await rli.question('Enter your new PIN: ');
-
-  const oldPin = BigInt(oldPinStr);
-  const newPin = BigInt(newPinStr);
-
-  await api.changePin(contract, oldPin, newPin);
-  logger.info('PIN change submitted successfully!');
-  logger.info('Note: If you have many loans, you may need to call this multiple times to complete the migration.');
-};
-
-const USER_PUBKEY_PROMPT_HINT =
-  "(64-char hex of the user's derived UserPublicKey — e.g. read from the on-chain `loans` map key, or shared by the target)";
-
-const parseUserPublicKeyHex = (input: string): Uint8Array => {
-  const hex = input.trim().toLowerCase().replace(/^0x/, '');
-  if (!/^[0-9a-f]{64}$/.test(hex)) {
-    throw new Error('User public key must be exactly 64 hex chars (32 bytes).');
-  }
-  return Uint8Array.from(Buffer.from(hex, 'hex'));
-};
-
-const blacklistUserFlow = async (contract: DeployedZKLoanCreditScorerContract, rli: Interface): Promise<void> => {
-  const input = await rli.question(`Enter the user public key to blacklist ${USER_PUBKEY_PROMPT_HINT}: `);
-  await api.blacklistUser(contract, parseUserPublicKeyHex(input));
-  logger.info('User public key blacklisted successfully!');
-};
-
-const removeBlacklistUserFlow = async (contract: DeployedZKLoanCreditScorerContract, rli: Interface): Promise<void> => {
-  const input = await rli.question(`Enter the user public key to remove from blacklist ${USER_PUBKEY_PROMPT_HINT}: `);
-  await api.removeBlacklistUser(contract, parseUserPublicKeyHex(input));
-  logger.info('User public key removed from blacklist successfully!');
+  await api.verifyEligibility(contract, providers, annualRevenueKrw, debtRatioBps, overdueCount, pin, attestationApiUrl);
+  logger.info('GASOK financial eligibility proof submitted successfully!');
 };
 
 // Rotate the admin role to a public key the new admin already derived
 // locally. The new admin runs `deriveAdminPublicKey(userSecret)` against
 // their own 32-byte user secret and hands the resulting public key (64 hex
 // chars) to the current admin. No private key is exchanged.
-const rotateAdminFlow = async (contract: DeployedZKLoanCreditScorerContract, rli: Interface): Promise<void> => {
+const rotateAdminFlow = async (contract: DeployedGasokEligibilityContract, rli: Interface): Promise<void> => {
   const input = await rli.question(
     'Enter the new admin derived public key (64 hex chars). ' +
-      'The new admin generates this with `deriveAdminPublicKey(userSecret)` and shares only the result: ',
+      'The new admin generates this with `deriveAdminPublicKey(companySecret)` and shares only the result: ',
   );
   const hex = input.trim().toLowerCase().replace(/^0x/, '');
   if (!/^[0-9a-f]{64}$/.test(hex)) {
@@ -156,7 +128,7 @@ const rotateAdminFlow = async (contract: DeployedZKLoanCreditScorerContract, rli
   logger.info('Admin role rotated successfully!');
 };
 
-const registerProviderFlow = async (contract: DeployedZKLoanCreditScorerContract, rli: Interface): Promise<void> => {
+const registerProviderFlow = async (contract: DeployedGasokEligibilityContract, rli: Interface): Promise<void> => {
   const providerIdStr = await rli.question('Enter the provider ID (number): ');
   const pkXStr = await rli.question('Enter the provider public key X coordinate (bigint): ');
   const pkYStr = await rli.question('Enter the provider public key Y coordinate (bigint): ');
@@ -168,7 +140,7 @@ const registerProviderFlow = async (contract: DeployedZKLoanCreditScorerContract
   logger.info('Attestation provider registered successfully!');
 };
 
-const removeProviderFlow = async (contract: DeployedZKLoanCreditScorerContract, rli: Interface): Promise<void> => {
+const removeProviderFlow = async (contract: DeployedGasokEligibilityContract, rli: Interface): Promise<void> => {
   const providerIdStr = await rli.question('Enter the provider ID to remove (number): ');
   const providerId = BigInt(providerIdStr);
 
@@ -177,7 +149,7 @@ const removeProviderFlow = async (contract: DeployedZKLoanCreditScorerContract, 
 };
 
 const mainLoop = async (
-  providers: ZKLoanCreditScorerProviders,
+  providers: GasokEligibilityProviders,
   walletContext: WalletContext,
   rli: Interface,
 ): Promise<void> => {
@@ -190,33 +162,24 @@ const mainLoop = async (
     try {
       switch (choice) {
         case '1':
-          await requestLoan(contract, providers, walletContext, rli);
+          await verifyEligibilityFlow(contract, providers, rli);
           break;
         case '2':
-          await changePinFlow(contract, rli);
-          break;
-        case '3':
           await api.displayContractState(providers, contract);
           break;
-        case '4':
+        case '3':
           await api.displayWalletBalances(walletContext.wallet);
           break;
-        case '5':
-          await blacklistUserFlow(contract, rli);
-          break;
-        case '6':
-          await removeBlacklistUserFlow(contract, rli);
-          break;
-        case '7':
+        case '4':
           await rotateAdminFlow(contract, rli);
           break;
-        case '8':
+        case '5':
           await registerProviderFlow(contract, rli);
           break;
-        case '9':
+        case '6':
           await removeProviderFlow(contract, rli);
           break;
-        case '10':
+        case '7':
           logger.info('Exiting...');
           return;
         default:

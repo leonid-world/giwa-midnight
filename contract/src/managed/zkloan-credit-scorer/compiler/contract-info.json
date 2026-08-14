@@ -4,7 +4,7 @@
   "runtime-version": "0.16.0",
   "circuits": [
     {
-      "name": "deriveUserPublicKey",
+      "name": "deriveCompanyCommitment",
       "pure": true,
       "proof": false,
       "arguments": [
@@ -12,7 +12,7 @@
           "name": "sk",
           "type": {
             "type-name": "Alias",
-            "name": "UserSecretKey",
+            "name": "CompanySecretKey",
             "type": {
               "type-name": "Bytes",
               "length": 32
@@ -29,7 +29,7 @@
       ],
       "result-type": {
         "type-name": "Alias",
-        "name": "UserPublicKey",
+        "name": "CompanyCommitment",
         "type": {
           "type-name": "Bytes",
           "length": 32
@@ -45,7 +45,7 @@
           "name": "sk",
           "type": {
             "type-name": "Alias",
-            "name": "UserSecretKey",
+            "name": "CompanySecretKey",
             "type": {
               "type-name": "Bytes",
               "length": 32
@@ -63,100 +63,15 @@
       }
     },
     {
-      "name": "requestLoan",
+      "name": "verifyEligibility",
       "pure": false,
       "proof": true,
       "arguments": [
-        {
-          "name": "amountRequested",
-          "type": {
-            "type-name": "Uint",
-            "maxval": 65535
-          }
-        },
         {
           "name": "secretPin",
           "type": {
             "type-name": "Uint",
             "maxval": 65535
-          }
-        }
-      ],
-      "result-type": {
-        "type-name": "Tuple",
-        "types": [
-        ]
-      }
-    },
-    {
-      "name": "respondToLoan",
-      "pure": false,
-      "proof": true,
-      "arguments": [
-        {
-          "name": "loanId",
-          "type": {
-            "type-name": "Uint",
-            "maxval": 65535
-          }
-        },
-        {
-          "name": "secretPin",
-          "type": {
-            "type-name": "Uint",
-            "maxval": 65535
-          }
-        },
-        {
-          "name": "accept",
-          "type": {
-            "type-name": "Boolean"
-          }
-        }
-      ],
-      "result-type": {
-        "type-name": "Tuple",
-        "types": [
-        ]
-      }
-    },
-    {
-      "name": "blacklistUser",
-      "pure": false,
-      "proof": true,
-      "arguments": [
-        {
-          "name": "account",
-          "type": {
-            "type-name": "Alias",
-            "name": "UserPublicKey",
-            "type": {
-              "type-name": "Bytes",
-              "length": 32
-            }
-          }
-        }
-      ],
-      "result-type": {
-        "type-name": "Tuple",
-        "types": [
-        ]
-      }
-    },
-    {
-      "name": "removeBlacklistUser",
-      "pure": false,
-      "proof": true,
-      "arguments": [
-        {
-          "name": "account",
-          "type": {
-            "type-name": "Alias",
-            "name": "UserPublicKey",
-            "type": {
-              "type-name": "Bytes",
-              "length": 32
-            }
           }
         }
       ],
@@ -239,32 +154,6 @@
       }
     },
     {
-      "name": "changePin",
-      "pure": false,
-      "proof": true,
-      "arguments": [
-        {
-          "name": "oldPin",
-          "type": {
-            "type-name": "Uint",
-            "maxval": 65535
-          }
-        },
-        {
-          "name": "newPin",
-          "type": {
-            "type-name": "Uint",
-            "maxval": 65535
-          }
-        }
-      ],
-      "result-type": {
-        "type-name": "Tuple",
-        "types": [
-        ]
-      }
-    },
-    {
       "name": "schnorrChallenge",
       "pure": true,
       "proof": false,
@@ -334,7 +223,7 @@
       }
     },
     {
-      "name": "getAttestedScoringWitness",
+      "name": "getAttestedFinancialWitness",
       "arguments": [
       ],
       "result type": {
@@ -342,24 +231,24 @@
         "types": [
           {
             "type-name": "Struct",
-            "name": "Applicant",
+            "name": "FinancialProfile",
             "elements": [
               {
-                "name": "creditScore",
+                "name": "annualRevenueKrw",
                 "type": {
                   "type-name": "Uint",
-                  "maxval": 65535
+                  "maxval": 18446744073709551615
                 }
               },
               {
-                "name": "monthlyIncome",
+                "name": "debtRatioBps",
                 "type": {
                   "type-name": "Uint",
-                  "maxval": 65535
+                  "maxval": 4294967295
                 }
               },
               {
-                "name": "monthsAsCustomer",
+                "name": "overdueCount",
                 "type": {
                   "type-name": "Uint",
                   "maxval": 65535
@@ -398,12 +287,12 @@
       }
     },
     {
-      "name": "getUserSecret",
+      "name": "getCompanySecret",
       "arguments": [
       ],
       "result type": {
         "type-name": "Alias",
-        "name": "UserSecretKey",
+        "name": "CompanySecretKey",
         "type": {
           "type-name": "Bytes",
           "length": 32
@@ -415,79 +304,48 @@
   ],
   "ledger": [
     {
-      "name": "blacklist",
+      "name": "eligibilityResults",
       "index": 0,
       "exported": true,
-      "storage": "Set",
-      "type": {
+      "storage": "Map",
+      "key": {
         "type-name": "Alias",
-        "name": "UserPublicKey",
+        "name": "CompanyCommitment",
         "type": {
           "type-name": "Bytes",
           "length": 32
         }
-      }
-    },
-    {
-      "name": "loans",
-      "index": 1,
-      "exported": true,
-      "storage": "Map",
-      "key": {
-        "type-name": "Bytes",
-        "length": 32
       },
       "value": {
-        "type-name": "Map",
-        "key": {
-          "type-name": "Uint",
-          "maxval": 65535
-        },
-        "value": {
-          "type-name": "Struct",
-          "name": "LoanApplication",
-          "elements": [
-            {
-              "name": "authorizedAmount",
-              "type": {
-                "type-name": "Uint",
-                "maxval": 65535
-              }
-            },
-            {
-              "name": "status",
-              "type": {
-                "type-name": "Enum",
-                "name": "LoanStatus",
-                "elements": [
-                  "Approved",
-                  "Rejected",
-                  "Proposed",
-                  "NotAccepted"
-                ]
-              }
+        "type-name": "Struct",
+        "name": "EligibilityResult",
+        "elements": [
+          {
+            "name": "eligible",
+            "type": {
+              "type-name": "Boolean"
             }
-          ]
-        }
-      }
-    },
-    {
-      "name": "onGoingPinMigration",
-      "index": 2,
-      "exported": true,
-      "storage": "Map",
-      "key": {
-        "type-name": "Bytes",
-        "length": 32
-      },
-      "value": {
-        "type-name": "Uint",
-        "maxval": 65535
+          },
+          {
+            "name": "providerId",
+            "type": {
+              "type-name": "Uint",
+              "maxval": 65535
+            }
+          },
+          {
+            "name": "policyVersion",
+            "type": {
+              "type-name": "Uint",
+              "maxval": 65535
+            }
+          }
+        ]
       }
     },
     {
       "name": "contractAdmin",
-      "index": 3,
+      "index": 1,
       "exported": true,
       "storage": "Cell",
       "type": {
@@ -501,7 +359,7 @@
     },
     {
       "name": "providers",
-      "index": 4,
+      "index": 2,
       "exported": true,
       "storage": "Map",
       "key": {

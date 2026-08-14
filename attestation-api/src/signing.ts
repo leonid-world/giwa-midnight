@@ -1,6 +1,6 @@
 import { ecMulGenerator, type JubjubPoint } from '@midnight-ntwrk/midnight-js-protocol/compact-runtime';
-import { ZKLoanCreditScorer } from 'zkloan-credit-scorer-contract';
-const { pureCircuits } = ZKLoanCreditScorer;
+import { GasokEligibility } from 'zkloan-credit-scorer-contract';
+const { pureCircuits } = GasokEligibility;
 
 type SchnorrSignature = {
   announcement: JubjubPoint;
@@ -29,7 +29,7 @@ export function getPublicKey(sk: bigint): JubjubPoint {
 
 export function sign(
   sk: bigint,
-  msg: bigint[],
+  msg: [bigint, bigint, bigint, bigint],
 ): SchnorrSignature {
   sk = ((sk % JUBJUB_ORDER) + JUBJUB_ORDER) % JUBJUB_ORDER;
   const pk = ecMulGenerator(sk);
@@ -44,18 +44,18 @@ export function sign(
   return { announcement: R, response: s };
 }
 
-export function signCreditData(
+export function signFinancialData(
   sk: bigint,
-  creditScore: number,
-  monthlyIncome: number,
-  monthsAsCustomer: number,
-  userPubKeyHash: bigint,
+  annualRevenueKrw: bigint,
+  debtRatioBps: bigint,
+  overdueCount: bigint,
+  companyCommitmentHash: bigint,
 ): SchnorrSignature {
-  const msg: bigint[] = [
-    BigInt(creditScore),
-    BigInt(monthlyIncome),
-    BigInt(monthsAsCustomer),
-    userPubKeyHash,
+  const msg: [bigint, bigint, bigint, bigint] = [
+    annualRevenueKrw,
+    debtRatioBps,
+    overdueCount,
+    companyCommitmentHash,
   ];
   return sign(sk, msg);
 }

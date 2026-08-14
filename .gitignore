@@ -4,4 +4,6 @@ dist/
 .env.local
 logs/
 .midnight-state/
+midnight-level-db/
+reports/
 *.log

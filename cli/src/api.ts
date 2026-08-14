@@ -19,7 +19,7 @@ import {
   transientHash,
   CompactTypeBytes,
 } from '@midnight-ntwrk/midnight-js-protocol/compact-runtime';
-import { ZKLoanCreditScorer, type ZKLoanCreditScorerPrivateState, witnesses } from 'zkloan-credit-scorer-contract';
+import { GasokEligibility, type GasokEligibilityPrivateState, witnesses } from 'zkloan-credit-scorer-contract';
 import * as ledger from '@midnight-ntwrk/midnight-js-protocol/ledger';
 import { CompiledContract } from '@midnight-ntwrk/midnight-js-protocol/compact-js';
 import { deployContract, findDeployedContract } from '@midnight-ntwrk/midnight-js-contracts';
@@ -60,14 +60,14 @@ import * as Rx from 'rxjs';
 import { WebSocket } from 'ws';
 import { Buffer } from 'buffer';
 import {
-  type ZKLoanCreditScorerContract,
-  type ZKLoanCreditScorerPrivateStateId,
-  type ZKLoanCreditScorerProviders,
-  type DeployedZKLoanCreditScorerContract,
-  type ZKLoanCreditScorerCircuits,
+  type GasokEligibilityContract,
+  type GasokEligibilityPrivateStateId,
+  type GasokEligibilityProviders,
+  type DeployedGasokEligibilityContract,
+  type GasokEligibilityCircuits,
 } from './common-types';
 import { type Config, contractConfig } from './config';
-import { getUserProfile } from './state.utils';
+import { getInitialPrivateState } from './state.utils';
 
 let logger: Logger;
 // @ts-expect-error: It's needed to enable WebSocket usage through apollo
@@ -81,33 +81,33 @@ export interface WalletContext {
   unshieldedKeystore: UnshieldedKeystore;
 }
 
-export const getZKLoanLedgerState = async (
-  providers: ZKLoanCreditScorerProviders,
+export const getGasokEligibilityLedgerState = async (
+  providers: GasokEligibilityProviders,
   contractAddress: ContractAddress,
-): Promise<ZKLoanCreditScorer.Ledger | null> => {
+): Promise<GasokEligibility.Ledger | null> => {
   assertIsContractAddress(contractAddress);
   logger.info('Checking contract ledger state...');
   const state = await providers.publicDataProvider
     .queryContractState(contractAddress)
-    .then((contractState) => (contractState != null ? ZKLoanCreditScorer.ledger(contractState.data) : null));
+    .then((contractState) => (contractState != null ? GasokEligibility.ledger(contractState.data) : null));
   return state;
 };
 
 // Create compiled contract using the stable API pattern
-export const zkLoanCompiledContract = CompiledContract.make<ZKLoanCreditScorerContract>(
-  'ZKLoanCreditScorer',
-  ZKLoanCreditScorer.Contract,
+export const gasokEligibilityCompiledContract = CompiledContract.make<GasokEligibilityContract>(
+  'GasokEligibility',
+  GasokEligibility.Contract,
 ).pipe(CompiledContract.withWitnesses(witnesses), CompiledContract.withCompiledFileAssets(contractConfig.zkConfigPath));
 
 export const joinContract = async (
-  providers: ZKLoanCreditScorerProviders,
+  providers: GasokEligibilityProviders,
   contractAddress: string,
-): Promise<DeployedZKLoanCreditScorerContract> => {
+): Promise<DeployedGasokEligibilityContract> => {
   const contract = await findDeployedContract(providers as any, {
     contractAddress,
-    compiledContract: zkLoanCompiledContract,
-    privateStateId: 'zkLoanCreditScorerPrivateState',
-    initialPrivateState: getUserProfile(),
+    compiledContract: gasokEligibilityCompiledContract,
+    privateStateId: 'gasokEligibilityPrivateState',
+    initialPrivateState: getInitialPrivateState(),
   });
   logger.info(`Joined contract at address: ${contract.deployTxData.public.contractAddress}`);
 
@@ -115,14 +115,14 @@ export const joinContract = async (
 };
 
 export const deploy = async (
-  providers: ZKLoanCreditScorerProviders,
-  privateState: ZKLoanCreditScorerPrivateState,
-): Promise<DeployedZKLoanCreditScorerContract> => {
-  logger.info('Deploying ZKLoan Credit Scorer contract...');
+  providers: GasokEligibilityProviders,
+  privateState: GasokEligibilityPrivateState,
+): Promise<DeployedGasokEligibilityContract> => {
+  logger.info('Deploying GASOK Financial Eligibility contract...');
 
   const contract = await deployContract(providers as any, {
-    compiledContract: zkLoanCompiledContract,
-    privateStateId: 'zkLoanCreditScorerPrivateState',
+    compiledContract: gasokEligibilityCompiledContract,
+    privateStateId: 'gasokEligibilityPrivateState',
     initialPrivateState: privateState,
     // Note: as of midnight-js 4.1.x, `args` is conditionally typed and must be
     // omitted entirely when the contract constructor takes no arguments.
@@ -132,45 +132,38 @@ export const deploy = async (
   return contract as any;
 };
 
-// ZKLoan-specific operations
+// GASOK financial-eligibility operations
 
 const bytes32Type = new CompactTypeBytes(32);
-const { pureCircuits } = ZKLoanCreditScorer;
+const { pureCircuits } = GasokEligibility;
 
-// Derive the per-user public key off-chain from the local user secret and a
-// PIN, using the same pure circuit the contract uses on-chain. The user
-// secret comes from private state — it is the only authoritative identity
-// for the caller, since `ownPublicKey()` is prover-claimed and not used.
-export const deriveUserPublicKey = (userSecretKey: Uint8Array, pin: bigint): Uint8Array => {
-  return pureCircuits.deriveUserPublicKey(userSecretKey, pin);
+export const deriveCompanyCommitment = (companySecretKey: Uint8Array, pin: bigint): Uint8Array => {
+  return pureCircuits.deriveCompanyCommitment(companySecretKey, pin);
 };
 
-// Compute the userPubKeyHash for an attestation message. The contract
-// computes this inside `requestLoan` via `transientHash(deriveUserPublicKey(secret, pin))`.
-export const computeUserPubKeyHash = (userSecretKey: Uint8Array, pin: bigint): bigint => {
-  const pubKey = deriveUserPublicKey(userSecretKey, pin);
-  return transientHash(bytes32Type, pubKey);
+export const computeCompanyCommitmentHash = (companySecretKey: Uint8Array, pin: bigint): bigint => {
+  return transientHash(bytes32Type, deriveCompanyCommitment(companySecretKey, pin));
 };
 
 export const fetchAttestation = async (
   attestationApiUrl: string,
-  creditScore: number,
-  monthlyIncome: number,
-  monthsAsCustomer: number,
-  userPubKeyHash: bigint,
+  annualRevenueKrw: bigint,
+  debtRatioBps: bigint,
+  overdueCount: bigint,
+  companyCommitmentHash: bigint,
 ): Promise<{ announcement: { x: bigint; y: bigint }; response: bigint }> => {
   const res = await fetch(`${attestationApiUrl}/attest`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      creditScore,
-      monthlyIncome,
-      monthsAsCustomer,
-      userPubKeyHash: userPubKeyHash.toString(),
+      annualRevenueKrw: annualRevenueKrw.toString(),
+      debtRatioBps: debtRatioBps.toString(),
+      overdueCount: overdueCount.toString(),
+      companyCommitmentHash: companyCommitmentHash.toString(),
     }),
   });
   if (!res.ok) {
-    throw new Error(`Attestation API error: ${res.status} ${await res.text()}`);
+    throw new Error(`Mock Attestation API error: ${res.status} ${await res.text()}`);
   }
   const data = (await res.json()) as { signature: { announcement: { x: string; y: string }; response: string } };
   return {
@@ -179,87 +172,51 @@ export const fetchAttestation = async (
   };
 };
 
-export const requestLoan = async (
-  contract: DeployedZKLoanCreditScorerContract,
-  providers: ZKLoanCreditScorerProviders,
-  amountRequested: bigint,
+export const verifyEligibility = async (
+  contract: DeployedGasokEligibilityContract,
+  providers: GasokEligibilityProviders,
+  annualRevenueKrw: bigint,
+  debtRatioBps: bigint,
+  overdueCount: bigint,
   secretPin: bigint,
   attestationApiUrl: string,
 ): Promise<FinalizedTxData> => {
-  // 1. Get current private state (must contain `userSecretKey`)
-  const currentState = await providers.privateStateProvider.get('zkLoanCreditScorerPrivateState');
+  const currentState = await providers.privateStateProvider.get('gasokEligibilityPrivateState');
   if (!currentState) {
     throw new Error('No private state found');
   }
 
-  // 2. Compute user pub key hash from the user secret (same as the circuit does)
-  const userPubKeyHash = computeUserPubKeyHash(currentState.userSecretKey, secretPin);
-  logger.info(`Computed userPubKeyHash for attestation`);
+  const companyCommitmentHash = computeCompanyCommitmentHash(currentState.companySecretKey, secretPin);
+  logger.info('Computed pseudonymous company commitment hash for mock attestation');
 
-  // 3. Fetch attestation signature from API
-  logger.info(`Fetching attestation from ${attestationApiUrl}...`);
+  logger.info(`Fetching mock attestation from ${attestationApiUrl}...`);
   const signature = await fetchAttestation(
     attestationApiUrl,
-    Number(currentState.creditScore),
-    Number(currentState.monthlyIncome),
-    Number(currentState.monthsAsCustomer),
-    userPubKeyHash,
+    annualRevenueKrw,
+    debtRatioBps,
+    overdueCount,
+    companyCommitmentHash,
   );
 
-  // 4. Get provider info
   const providerRes = await fetch(`${attestationApiUrl}/provider-info`);
+  if (!providerRes.ok) {
+    throw new Error(`Mock provider info error: ${providerRes.status} ${await providerRes.text()}`);
+  }
   const providerInfo = (await providerRes.json()) as { providerId: number };
 
-  // 5. Update private state with attestation data
-  const updatedState: ZKLoanCreditScorerPrivateState = {
+  const updatedState: GasokEligibilityPrivateState = {
     ...currentState,
+    annualRevenueKrw,
+    debtRatioBps,
+    overdueCount,
     attestationSignature: signature,
     attestationProviderId: BigInt(providerInfo.providerId),
   };
-  await providers.privateStateProvider.set('zkLoanCreditScorerPrivateState', updatedState);
-  logger.info(`Private state updated with attestation (provider ${providerInfo.providerId})`);
+  await providers.privateStateProvider.set('gasokEligibilityPrivateState', updatedState);
+  logger.info(`Private state updated with mock attestation (provider ${providerInfo.providerId})`);
 
-  // 6. Call the circuit
-  logger.info(`Requesting loan for $${amountRequested} (USD) with PIN...`);
-  const finalizedTxData = await contract.callTx.requestLoan(amountRequested, secretPin);
-  logger.info(`Transaction ${finalizedTxData.public.txId} added in block ${finalizedTxData.public.blockHeight}`);
-  return finalizedTxData.public;
-};
-
-export const changePin = async (
-  contract: DeployedZKLoanCreditScorerContract,
-  oldPin: bigint,
-  newPin: bigint,
-): Promise<FinalizedTxData> => {
-  logger.info('Changing PIN...');
-  const finalizedTxData = await contract.callTx.changePin(oldPin, newPin);
-  logger.info(`Transaction ${finalizedTxData.public.txId} added in block ${finalizedTxData.public.blockHeight}`);
-  return finalizedTxData.public;
-};
-
-// Blacklist a user by their derived `UserPublicKey` (the value the contract
-// checks inside `assert(!blacklist.member(deriveUserPublicKey(...)))`). The
-// admin must obtain this 32-byte value out of band — typically by reading
-// the on-chain `loans` map keys for users who have already interacted, or
-// by asking the target to share their derived pubkey directly. Note that
-// admin cannot blacklist by wallet address, since `ownPublicKey()` is not
-// trusted by the contract.
-export const blacklistUser = async (
-  contract: DeployedZKLoanCreditScorerContract,
-  userPublicKey: Uint8Array,
-): Promise<FinalizedTxData> => {
-  logger.info('Blacklisting user public key...');
-  const finalizedTxData = await contract.callTx.blacklistUser(userPublicKey);
-  logger.info(`Transaction ${finalizedTxData.public.txId} added in block ${finalizedTxData.public.blockHeight}`);
-  return finalizedTxData.public;
-};
-
-export const removeBlacklistUser = async (
-  contract: DeployedZKLoanCreditScorerContract,
-  userPublicKey: Uint8Array,
-): Promise<FinalizedTxData> => {
-  logger.info('Removing user public key from blacklist...');
-  const finalizedTxData = await contract.callTx.removeBlacklistUser(userPublicKey);
+  logger.info('Generating and submitting GASOK financial eligibility proof...');
+  const finalizedTxData = await contract.callTx.verifyEligibility(secretPin);
   logger.info(`Transaction ${finalizedTxData.public.txId} added in block ${finalizedTxData.public.blockHeight}`);
   return finalizedTxData.public;
 };
@@ -269,7 +226,7 @@ export const removeBlacklistUser = async (
 // `deriveAdminPublicKey(secret)` off-chain; only the resulting 32-byte
 // public key crosses the wire. No private key is ever transmitted.
 export const rotateAdmin = async (
-  contract: DeployedZKLoanCreditScorerContract,
+  contract: DeployedGasokEligibilityContract,
   newAdminPublicKey: Uint8Array,
 ): Promise<FinalizedTxData> => {
   logger.info('Rotating admin role to new derived public key...');
@@ -283,12 +240,12 @@ export const rotateAdmin = async (
 // Same `userSecretKey` is used for both per-user identity (PIN-bound) and
 // the admin role (no PIN) — different domain separators inside the contract
 // keep them logically independent.
-export const deriveAdminPublicKey = (userSecretKey: Uint8Array): Uint8Array => {
-  return pureCircuits.deriveAdminPublicKey(userSecretKey);
+export const deriveAdminPublicKey = (companySecretKey: Uint8Array): Uint8Array => {
+  return pureCircuits.deriveAdminPublicKey(companySecretKey);
 };
 
 export const registerProvider = async (
-  contract: DeployedZKLoanCreditScorerContract,
+  contract: DeployedGasokEligibilityContract,
   providerId: bigint,
   providerPk: { x: bigint; y: bigint },
 ): Promise<FinalizedTxData> => {
@@ -299,7 +256,7 @@ export const registerProvider = async (
 };
 
 export const removeProvider = async (
-  contract: DeployedZKLoanCreditScorerContract,
+  contract: DeployedGasokEligibilityContract,
   providerId: bigint,
 ): Promise<FinalizedTxData> => {
   logger.info(`Removing attestation provider ${providerId}...`);
@@ -309,17 +266,24 @@ export const removeProvider = async (
 };
 
 export const displayContractState = async (
-  providers: ZKLoanCreditScorerProviders,
-  contract: DeployedZKLoanCreditScorerContract,
-): Promise<{ ledgerState: ZKLoanCreditScorer.Ledger | null; contractAddress: string }> => {
+  providers: GasokEligibilityProviders,
+  contract: DeployedGasokEligibilityContract,
+): Promise<{ ledgerState: GasokEligibility.Ledger | null; contractAddress: string }> => {
   const contractAddress = contract.deployTxData.public.contractAddress;
-  const ledgerState = await getZKLoanLedgerState(providers, contractAddress);
+  const ledgerState = await getGasokEligibilityLedgerState(providers, contractAddress);
   if (ledgerState === null) {
-    logger.info(`There is no ZKLoan contract deployed at ${contractAddress}.`);
+    logger.info(`There is no GASOK Financial Eligibility contract deployed at ${contractAddress}.`);
   } else {
     logger.info(`Contract address: ${contractAddress}`);
     logger.info(`Admin public key: ${Buffer.from(ledgerState.contractAdmin).toString('hex')}`);
-    logger.info(`Blacklist size: ${ledgerState.blacklist.size()}`);
+    logger.info(`Registered providers: ${ledgerState.providers.size()}`);
+    logger.info(`Public eligibility results: ${ledgerState.eligibilityResults.size()}`);
+    for (const [commitment, result] of ledgerState.eligibilityResults) {
+      logger.info(
+        `Commitment ${Buffer.from(commitment).toString('hex')}: eligible=${result.eligible}, ` +
+          `providerId=${result.providerId}, policyVersion=${result.policyVersion}`,
+      );
+    }
   }
   return { contractAddress, ledgerState };
 };
@@ -659,7 +623,7 @@ export const buildWalletFromHexSeed = async (config: Config, hexSeed: string): P
 export const configureProviders = async (
   walletContext: WalletContext,
   config: Config,
-): Promise<ZKLoanCreditScorerProviders> => {
+): Promise<GasokEligibilityProviders> => {
   // Set global network ID - required before contract deployment
   setNetworkId(config.networkId);
 
@@ -673,10 +637,10 @@ export const configureProviders = async (
     );
   }
 
-  const zkConfigProvider = new NodeZkConfigProvider<ZKLoanCreditScorerCircuits>(contractConfig.zkConfigPath);
+  const zkConfigProvider = new NodeZkConfigProvider<GasokEligibilityCircuits>(contractConfig.zkConfigPath);
 
   return {
-    privateStateProvider: levelPrivateStateProvider<typeof ZKLoanCreditScorerPrivateStateId>({
+    privateStateProvider: levelPrivateStateProvider<typeof GasokEligibilityPrivateStateId>({
       privateStateStoreName: contractConfig.privateStateStoreName,
       privateStoragePasswordProvider: () => storagePassword,
       accountId: walletContext.unshieldedKeystore.getBech32Address().asString(),

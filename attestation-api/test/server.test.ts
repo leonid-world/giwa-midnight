@@ -15,7 +15,7 @@ describe('Attestation API Server', () => {
   beforeAll(async () => {
     server = createServer(sk, providerId);
     await new Promise<void>((resolve) => {
-      server.listen(0, () => {
+      server.listen(0, '127.0.0.1', () => {
         const addr = server.address();
         const port = typeof addr === 'string' ? addr : addr?.port;
         baseUrl = `http://127.0.0.1:${port}`;
@@ -36,6 +36,8 @@ describe('Attestation API Server', () => {
     const body = await res.json();
     expect(body.status).toBe('ok');
     expect(body.providerId).toBe(providerId);
+    expect(body.attestationType).toBe('mock');
+    expect(res.headers.get('access-control-allow-origin')).toBeNull();
   });
 
   it('GET /provider-info returns provider public key', async () => {
@@ -45,6 +47,7 @@ describe('Attestation API Server', () => {
     expect(body.providerId).toBe(providerId);
     expect(body.publicKey.x).toBe(pk.x.toString());
     expect(body.publicKey.y).toBe(pk.y.toString());
+    expect(body.attestationType).toBe('mock');
   });
 
   it('POST /attest returns valid attestation', async () => {
@@ -52,10 +55,10 @@ describe('Attestation API Server', () => {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        creditScore: 720,
-        monthlyIncome: 2500,
-        monthsAsCustomer: 24,
-        userPubKeyHash: '12345678901234567890',
+        annualRevenueKrw: '500000000',
+        debtRatioBps: '20000',
+        overdueCount: '1',
+        companyCommitmentHash: '12345678901234567890',
       }),
     });
     expect(res.status).toBe(200);
@@ -65,9 +68,11 @@ describe('Attestation API Server', () => {
     expect(body.signature.announcement.x).toBeDefined();
     expect(body.signature.announcement.y).toBeDefined();
     expect(body.signature.response).toBeDefined();
-    expect(body.message.creditScore).toBe('720');
-    expect(body.message.monthlyIncome).toBe('2500');
-    expect(body.message.monthsAsCustomer).toBe('24');
+    expect(body.providerId).toBe(providerId);
+    expect(body.attestationType).toBe('mock');
+    expect(body.message).toBeUndefined();
+    expect(JSON.stringify(body)).not.toContain('500000000');
+    expect(JSON.stringify(body)).not.toContain('20000');
   });
 
   it('POST /attest returns 400 for missing fields', async () => {
@@ -75,12 +80,54 @@ describe('Attestation API Server', () => {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        creditScore: 720,
+        annualRevenueKrw: '500000000',
         // missing other fields
       }),
     });
     expect(res.status).toBe(400);
     const body = await res.json();
-    expect(body.error).toContain('Missing required fields');
+    expect(body.error).toContain('debtRatioBps');
+  });
+
+  it.each([
+    ['annualRevenueKrw', '-1'],
+    ['annualRevenueKrw', '18446744073709551616'],
+    ['debtRatioBps', '4294967296'],
+    ['overdueCount', '65536'],
+    ['companyCommitmentHash', '-1'],
+  ])('POST /attest returns 400 when %s is invalid', async (field, value) => {
+    const request = {
+      annualRevenueKrw: '500000000',
+      debtRatioBps: '20000',
+      overdueCount: '1',
+      companyCommitmentHash: '12345678901234567890',
+      [field]: value,
+    };
+    const res = await fetch(`${baseUrl}/attest`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(request),
+    });
+
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toContain(field);
+  });
+
+  it('rejects non-string financial values instead of accepting JSON numbers', async () => {
+    const res = await fetch(`${baseUrl}/attest`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        annualRevenueKrw: 500000000,
+        debtRatioBps: '20000',
+        overdueCount: '1',
+        companyCommitmentHash: '12345678901234567890',
+      }),
+    });
+
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toContain('annualRevenueKrw');
   });
 });

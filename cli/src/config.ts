@@ -19,7 +19,7 @@ import { setNetworkId } from '@midnight-ntwrk/midnight-js-network-id';
 export const currentDir = path.resolve(new URL(import.meta.url).pathname, '..');
 
 export const contractConfig = {
-  privateStateStoreName: 'zkloan-credit-scorer-private-state',
+  privateStateStoreName: 'gasok-financial-eligibility-private-state',
   zkConfigPath: path.resolve(currentDir, '..', '..', 'contract', 'src', 'managed', 'zkloan-credit-scorer'),
 };
 
