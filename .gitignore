@@ -6,4 +6,5 @@ logs/
 .midnight-state/
 midnight-level-db/
 reports/
+.gasok-midnight-private-state.lock
 *.log

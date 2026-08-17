@@ -14,4 +14,6 @@
 // limitations under the License.
 
 export * from './api';
+export * from './authorization';
 export * from './cli';
+export * from './giwa';

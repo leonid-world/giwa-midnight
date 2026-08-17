@@ -22,9 +22,68 @@ import { type Config, StandaloneConfig } from './config';
 import * as api from './api';
 import type { WalletContext } from './api';
 import { getInitialPrivateState } from './state.utils';
+import {
+  parseSubjectRole,
+  parseUnsignedDecimal,
+  UINT16_MAX,
+  UINT32_MAX,
+  UINT64_MAX,
+  UINT256_MAX,
+} from './giwa';
+import {
+  parseAuthorizationProofJson,
+  type AuthorizationChallenge,
+  type AuthorizationProof,
+} from './authorization';
 import 'dotenv/config';
 
 let logger: Logger;
+
+export interface InteractiveSecretOutput {
+  readonly isTTY?: boolean;
+  write(message: string): unknown;
+}
+
+export function writeFreshWalletMnemonicOnce(
+  mnemonic: string,
+  terminal: InteractiveSecretOutput = output,
+): void {
+  if (terminal.isTTY !== true) {
+    throw new Error('Fresh wallet creation requires an interactive TTY so its recovery phrase can be shown safely.');
+  }
+  terminal.write(
+    '\nFresh wallet recovery phrase (shown once; store it securely):\n' +
+      `${mnemonic}\n` +
+      'WARNING: Anyone with this phrase controls the wallet. It will not be written to the CLI log file.\n\n',
+  );
+}
+
+export function writeRoleAuthorizationRequest(
+  challenge: AuthorizationChallenge,
+  terminal: InteractiveSecretOutput = output,
+): void {
+  if (terminal.isTTY !== true) {
+    throw new Error('GIWA role-wallet authorization requires an interactive TTY.');
+  }
+  terminal.write(
+    '\nOne-time GIWA role-wallet authorization request (sign with the displayed party wallet):\n' +
+      `${JSON.stringify(challenge)}\n` +
+      'This EIP-712 request contains a salted commitment, not the raw financial values or authorization salt.\n' +
+      'Do not paste a private key or recovery phrase into this CLI.\n\n',
+  );
+}
+
+async function obtainRoleAuthorization(
+  challenge: AuthorizationChallenge,
+  rli: Interface,
+): Promise<AuthorizationProof> {
+  writeRoleAuthorizationRequest(challenge);
+  const response = await rli.question(
+    'Paste the single-line MetaMask authorization response JSON ' +
+      '({version, authorizationId, typedDataHash, signer, signature}): ',
+  );
+  return parseAuthorizationProofJson(response, challenge);
+}
 
 /**
  * This seed gives access to tokens minted in the genesis block of a local development node - only
@@ -78,37 +137,55 @@ const deployOrJoin = async (
   }
 };
 
-const parseUint = (input: string, label: string, max: bigint): bigint => {
-  const value = input.trim();
-  if (!/^\d+$/.test(value)) {
-    throw new Error(`${label} must be a non-negative integer.`);
-  }
-  const parsed = BigInt(value);
-  if (parsed > max) {
-    throw new Error(`${label} exceeds the supported range.`);
-  }
-  return parsed;
-};
-
 const verifyEligibilityFlow = async (
   contract: DeployedGasokEligibilityContract,
   providers: GasokEligibilityProviders,
   rli: Interface,
 ): Promise<void> => {
+  const onchainReceivableIdStr = await rli.question('Enter the GIWA on-chain receivable ID (uint256): ');
+  const subjectRoleStr = await rli.question('Select the financial subject role (1 = SELLER, 2 = BUYER): ');
   const annualRevenueKrwStr = await rli.question('Enter annual revenue in integer KRW: ');
   const debtRatioBpsStr = await rli.question('Enter debt ratio in basis points (200.00% = 20000): ');
   const overdueCountStr = await rli.question('Enter overdue count: ');
   const pinStr = await rli.question('Enter your secret PIN: ');
 
-  const annualRevenueKrw = parseUint(annualRevenueKrwStr, 'Annual revenue', (1n << 64n) - 1n);
-  const debtRatioBps = parseUint(debtRatioBpsStr, 'Debt ratio', (1n << 32n) - 1n);
-  const overdueCount = parseUint(overdueCountStr, 'Overdue count', (1n << 16n) - 1n);
-  const pin = parseUint(pinStr, 'PIN', (1n << 16n) - 1n);
+  const onchainReceivableId = parseUnsignedDecimal(onchainReceivableIdStr, 'GIWA receivable ID', UINT256_MAX, {
+    positive: true,
+  });
+  const subjectRole = parseSubjectRole(subjectRoleStr);
+  const annualRevenueKrw = parseUnsignedDecimal(annualRevenueKrwStr, 'Annual revenue', UINT64_MAX);
+  const debtRatioBps = parseUnsignedDecimal(debtRatioBpsStr, 'Debt ratio', UINT32_MAX);
+  const overdueCount = parseUnsignedDecimal(overdueCountStr, 'Overdue count', UINT16_MAX);
+  const pin = parseUnsignedDecimal(pinStr, 'PIN', UINT16_MAX);
 
   const attestationApiUrl = process.env.ATTESTATION_API_URL || 'http://localhost:4000';
 
-  await api.verifyEligibility(contract, providers, annualRevenueKrw, debtRatioBps, overdueCount, pin, attestationApiUrl);
+  const verification = await api.verifyEligibility(
+    contract,
+    providers,
+    onchainReceivableId,
+    subjectRole,
+    annualRevenueKrw,
+    debtRatioBps,
+    overdueCount,
+    pin,
+    attestationApiUrl,
+    async (challenge) => await obtainRoleAuthorization(challenge, rli),
+  );
   logger.info('GASOK financial eligibility proof submitted successfully!');
+
+  // This capability is intentionally written only to the terminal. The normal
+  // logger also writes to disk, and this correlation-sensitive bundle should
+  // be shared only when the user explicitly chooses a verifier.
+  output.write(
+    `\nProof capability (share only with the intended verifier):\n${JSON.stringify(
+      verification.proofCapability,
+      null,
+      2,
+    )}\n` +
+      'WARNING: This capability links a pseudonymous Midnight result to one GIWA receivable party. ' +
+      'It contains no PIN, secret, financial values, or provider signature, but it is correlation-sensitive.\n\n',
+  );
 };
 
 // Rotate the admin role to a public key the new admin already derived
@@ -221,15 +298,22 @@ const buildWallet = async (config: Config, rli: Interface): Promise<WalletContex
     const choice = await rli.question(WALLET_LOOP_QUESTION);
     switch (choice) {
       case '1':
-        return await api.buildFreshWallet(config);
+        if (output.isTTY !== true) {
+          throw new Error('Fresh wallet creation requires an interactive TTY.');
+        }
+        {
+          const mnemonic = api.generateFreshWalletMnemonic();
+          writeFreshWalletMnemonicOnce(mnemonic);
+          return await api.buildWalletAndWaitForFunds(config, mnemonic);
+        }
       case '2':
         return await buildWalletFromMnemonic(config, rli);
       case '3':
         if (envMnemonic) {
-          logger.info('Using mnemonic from .env file...');
+          logger.info('Using the wallet recovery phrase from the configured environment variable...');
           return await api.buildWalletAndWaitForFunds(config, envMnemonic);
         } else {
-          logger.error('No WALLET_MNEMONIC found in .env file');
+          logger.error('No wallet recovery phrase was found in the configured environment variable');
         }
         break;
       case '4':

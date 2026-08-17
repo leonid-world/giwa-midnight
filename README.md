@@ -10,6 +10,11 @@ evaluates annual revenue in integer KRW (`Uint<64>`), debt ratio in basis points
 pseudonymous commitment, `eligible`, Mock Provider ID, and policy version are
 public.
 
+The current Phase 2.5 contract keeps only an opaque receivable-role lookup key
+with `eligible`, Provider ID, and policy version. Provider 2 adds the ADR-017
+off-chain EIP-712 issuance gate; it does not change the Compact contract,
+eight-field Schnorr message, public ledger schema, or deployed address.
+
 The current package name and generated `managed/zkloan-credit-scorer` path are
 retained temporarily to keep the first behavioral conversion small; the active
 exported contract API is `GasokEligibility`.
@@ -27,10 +32,33 @@ Restify/SPDY dependency path.
 - `api/`: localhost-only public-ledger read adapter for the dev Vue viewer; no
   Spring Boot replacement
 - `cli/`: local wallet, private state, proof, deployment, and state-query flow
-- `attestation-api/`: mock-only Schnorr attestation provider
+- `attestation-api/`: mock-only Provider 1 legacy / Provider 2 EIP-712-gated
+  Schnorr attestation provider
 
 Private financial data, signatures, mnemonics, provider secrets, private state,
 and logs are local-only and must not be committed.
+
+## Provider 2 authorization handoff
+
+Provider 2 requires a canonical Seller/Buyer EOA authorization before it issues
+the existing Schnorr attestation:
+
+1. The CLI keeps the raw mock financial tuple and hidden salt and requests a
+   random two-minute challenge.
+2. It prints the exact EIP-712 request for manual paste into the existing Vue
+   application's development-only `/midnight/authorize` route.
+3. Vue validates the fixed GIWA/Midnight/Provider context, selects exactly the
+   canonical role wallet in MetaMask, signs, verifies the recovered signer, and
+   returns minified one-line JSON for CLI paste.
+4. The Mock Provider consumes the challenge once, re-resolves the GIWA role,
+   recomputes the salted request commitment, and recovers the EOA before
+   Schnorr issuance.
+
+Raw financial values and the hidden salt never enter Vue. Compact verifies the
+registered Provider's Schnorr signature; Midnight does not independently verify
+the EIP-712 signature. Provider 1 results remain legacy role-context-only
+results. Provider 2 registration, actual MetaMask signing, and the complete
+local proof/transaction/Indexer E2E are still pending.
 
 ## Runtime compatibility
 
@@ -50,7 +78,7 @@ find node_modules -path '*/@midnight-ntwrk/onchain-runtime-v3/package.json' -pri
 Both Compact runtime and Midnight.js protocol must be `deduped` to the single
 root package path.
 
-## Phase 3A public viewer
+## Phase 3A capability viewer
 
 With the local Node and Indexer running, start the read-only adapter under Node
 22:
@@ -62,12 +90,20 @@ npm run start --workspace giwa-midnight-api
 ```
 
 It binds to `http://127.0.0.1:4100`. The existing Vue development server proxies
-`/midnight-api` to it and displays CLI-created public results at `/midnight`.
+`/midnight-api` to it and resolves one intentionally shared CLI Proof capability
+at `/midnight`; it does not anonymously enumerate public results.
 The adapter cannot request attestations, access the CLI wallet/private state,
 generate proofs, register providers, or submit transactions. It reads only the
-configured GASOK contract. After redeploying locally, set the public address for
-the adapter and update the Vue development environment to the same value:
+configured GASOK contract. The adapter is the sole address authority for the
+viewer; Vue has no Midnight-contract environment default. After an approved
+local redeployment, update the adapter's pinned public address:
 
 ```sh
 MIDNIGHT_CONTRACT_ADDRESS=<64-hex-address> npm run start --workspace giwa-midnight-api
 ```
+
+Current ADR-017 code checks: authorization-focused Attestation tests `18/18`;
+the preceding full Attestation run `71/71` before the latest zero-value patch
+(full listen suite not yet rerun afterward); CLI `57` with `1` optional
+environment E2E skipped; and Vue lint/build checks passing. These do not replace
+the pending full Provider 2 local runtime E2E.

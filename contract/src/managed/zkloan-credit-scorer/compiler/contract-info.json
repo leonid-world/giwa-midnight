@@ -63,6 +63,135 @@
       }
     },
     {
+      "name": "deriveGiwaReceivableBindingHash",
+      "pure": true,
+      "proof": false,
+      "arguments": [
+        {
+          "name": "configuredGiwaChainId",
+          "type": {
+            "type-name": "Uint",
+            "maxval": 18446744073709551615
+          }
+        },
+        {
+          "name": "configuredReceivableFinanceAddress",
+          "type": {
+            "type-name": "Bytes",
+            "length": 20
+          }
+        },
+        {
+          "name": "subject",
+          "type": {
+            "type-name": "Struct",
+            "name": "GiwaReceivableSubject",
+            "elements": [
+              {
+                "name": "receivableId",
+                "type": {
+                  "type-name": "Bytes",
+                  "length": 32
+                }
+              },
+              {
+                "name": "subjectRole",
+                "type": {
+                  "type-name": "Uint",
+                  "maxval": 255
+                }
+              },
+              {
+                "name": "partyWallet",
+                "type": {
+                  "type-name": "Bytes",
+                  "length": 20
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "result-type": {
+        "type-name": "Alias",
+        "name": "GiwaReceivableBindingHash",
+        "type": {
+          "type-name": "Bytes",
+          "length": 32
+        }
+      }
+    },
+    {
+      "name": "deriveMidnightDeploymentHash",
+      "pure": true,
+      "proof": false,
+      "arguments": [
+        {
+          "name": "contractAddress",
+          "type": {
+            "type-name": "Bytes",
+            "length": 32
+          }
+        }
+      ],
+      "result-type": {
+        "type-name": "Alias",
+        "name": "MidnightDeploymentHash",
+        "type": {
+          "type-name": "Bytes",
+          "length": 32
+        }
+      }
+    },
+    {
+      "name": "deriveReceivableEligibilityKey",
+      "pure": true,
+      "proof": false,
+      "arguments": [
+        {
+          "name": "companyCommitment",
+          "type": {
+            "type-name": "Alias",
+            "name": "CompanyCommitment",
+            "type": {
+              "type-name": "Bytes",
+              "length": 32
+            }
+          }
+        },
+        {
+          "name": "bindingHash",
+          "type": {
+            "type-name": "Alias",
+            "name": "GiwaReceivableBindingHash",
+            "type": {
+              "type-name": "Bytes",
+              "length": 32
+            }
+          }
+        },
+        {
+          "name": "deploymentHash",
+          "type": {
+            "type-name": "Alias",
+            "name": "MidnightDeploymentHash",
+            "type": {
+              "type-name": "Bytes",
+              "length": 32
+            }
+          }
+        }
+      ],
+      "result-type": {
+        "type-name": "Alias",
+        "name": "ReceivableEligibilityKey",
+        "type": {
+          "type-name": "Bytes",
+          "length": 32
+        }
+      }
+    },
+    {
       "name": "verifyEligibility",
       "pure": false,
       "proof": true,
@@ -72,6 +201,36 @@
           "type": {
             "type-name": "Uint",
             "maxval": 65535
+          }
+        },
+        {
+          "name": "subject",
+          "type": {
+            "type-name": "Struct",
+            "name": "GiwaReceivableSubject",
+            "elements": [
+              {
+                "name": "receivableId",
+                "type": {
+                  "type-name": "Bytes",
+                  "length": 32
+                }
+              },
+              {
+                "name": "subjectRole",
+                "type": {
+                  "type-name": "Uint",
+                  "maxval": 255
+                }
+              },
+              {
+                "name": "partyWallet",
+                "type": {
+                  "type-name": "Bytes",
+                  "length": 20
+                }
+              }
+            ]
           }
         }
       ],
@@ -186,7 +345,7 @@
           "name": "msg",
           "type": {
             "type-name": "Vector",
-            "length": 4,
+            "length": 8,
             "type": {
               "type-name": "Field"
             }
@@ -310,7 +469,7 @@
       "storage": "Map",
       "key": {
         "type-name": "Alias",
-        "name": "CompanyCommitment",
+        "name": "ReceivableEligibilityKey",
         "type": {
           "type-name": "Bytes",
           "length": 32
@@ -373,6 +532,26 @@
           "type-name": "Opaque",
           "tsType": "JubjubPoint"
         }
+      }
+    },
+    {
+      "name": "giwaChainId",
+      "index": 3,
+      "exported": true,
+      "storage": "Cell",
+      "type": {
+        "type-name": "Uint",
+        "maxval": 18446744073709551615
+      }
+    },
+    {
+      "name": "receivableFinanceAddress",
+      "index": 4,
+      "exported": true,
+      "storage": "Cell",
+      "type": {
+        "type-name": "Bytes",
+        "length": 20
       }
     }
   ]

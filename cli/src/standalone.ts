@@ -16,6 +16,7 @@
 import { createLogger } from './logger-utils.js';
 import { run } from './cli.js';
 import { StandaloneConfig } from './config.js';
+import { acquirePrivateStateProcessLock } from './private-state-process-lock.js';
 
 // Connects to an already-running local Midnight network (managed by midnight-local-network).
 // No docker containers are started here — the network must be running at the default ports:
@@ -24,4 +25,9 @@ import { StandaloneConfig } from './config.js';
 //   Proof Server: http://127.0.0.1:6300
 const config = new StandaloneConfig();
 const logger = await createLogger(config.logDir);
-await run(config, logger);
+const processLock = await acquirePrivateStateProcessLock('interactive-cli');
+try {
+  await run(config, logger);
+} finally {
+  await processLock.release();
+}

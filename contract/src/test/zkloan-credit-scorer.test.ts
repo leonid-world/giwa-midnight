@@ -3,11 +3,32 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { setNetworkId } from '@midnight-ntwrk/midnight-js-network-id';
+import { ecAdd, ecMul, ecMulGenerator } from '@midnight-ntwrk/midnight-js-protocol/compact-runtime';
 import { describe, expect, it } from 'vitest';
+import {
+  pureCircuits,
+  type GiwaReceivableSubject,
+} from '../managed/zkloan-credit-scorer/contract/index.js';
 import { GasokEligibilitySimulator } from './zkloan-credit-scorer.simulator.js';
-import { createSignedFinancialProfile, generateProviderKeyPair } from './utils/test-data.js';
+import {
+  BUYER_ROLE,
+  BUYER_WALLET_HEX,
+  GIWA_CHAIN_ID,
+  RECEIVABLE_FINANCE_ADDRESS,
+  SELLER_ROLE,
+  SELLER_WALLET_HEX,
+  UINT256_MAX,
+  bytesToUint256,
+  createGiwaReceivableSubject,
+  createSignedFinancialProfile,
+  evmAddressToBytes,
+  generateProviderKeyPair,
+  uint256ToBytes,
+} from './utils/test-data.js';
 
 setNetworkId('undeployed');
+
+const TWO_248 = 1n << 248n;
 
 describe('GASOK financial eligibility contract', () => {
   const defaultPin = 1234n;
@@ -22,13 +43,23 @@ describe('GASOK financial eligibility contract', () => {
       providerId?: bigint;
       providerSk?: bigint;
       companySecretKey?: Uint8Array;
+      subject?: GiwaReceivableSubject;
+      giwaChainId?: bigint;
+      receivableFinanceAddress?: Uint8Array;
+      midnightContractAddressBytes?: Uint8Array;
     } = {},
   ): void {
     const pin = options.pin ?? defaultPin;
     const providerId = options.providerId ?? simulator.providerId;
     const providerSk = options.providerSk ?? simulator.providerSk;
     const companySecretKey = options.companySecretKey ?? simulator.getPrivateState().companySecretKey;
-    const commitmentHash = simulator.computeCompanyCommitmentHash(companySecretKey, pin);
+    const subject = options.subject ?? simulator.defaultSubject;
+    const binding = simulator.createAttestationBinding(companySecretKey, pin, subject, {
+      giwaChainId: options.giwaChainId,
+      receivableFinanceAddress: options.receivableFinanceAddress,
+      midnightContractAddressBytes: options.midnightContractAddressBytes,
+      providerId,
+    });
 
     simulator.setPrivateState(
       createSignedFinancialProfile(
@@ -36,19 +67,23 @@ describe('GASOK financial eligibility contract', () => {
         debtRatioBps,
         overdueCount,
         providerSk,
-        commitmentHash,
-        providerId,
+        binding,
         companySecretKey,
       ),
     );
   }
 
-  function readResult(simulator: GasokEligibilitySimulator, pin: bigint = defaultPin) {
-    const companyCommitment = simulator.deriveCompanyCommitment(
+  function readResult(
+    simulator: GasokEligibilitySimulator,
+    pin: bigint = defaultPin,
+    subject: GiwaReceivableSubject = simulator.defaultSubject,
+  ) {
+    const key = simulator.deriveReceivableEligibilityKey(
       simulator.getPrivateState().companySecretKey,
       pin,
+      subject,
     );
-    return simulator.getLedger().eligibilityResults.lookup(companyCommitment);
+    return simulator.getLedger().eligibilityResults.lookup(key);
   }
 
   it('records eligible=true exactly at all three policy boundaries', () => {
@@ -73,43 +108,21 @@ describe('GASOK financial eligibility contract', () => {
     expect(readResult(simulator).eligible).toBe(true);
   });
 
-  it('records eligible=false when revenue is one KRW below the threshold', () => {
+  it.each([
+    ['revenue is one KRW below the threshold', 499999999n, 20000n, 1n],
+    ['debt ratio is one basis point above the threshold', 500000000n, 20001n, 1n],
+    ['debt ratio exceeds the Uint16 range', 500000000n, 70000n, 0n],
+    ['overdue count is one above the threshold', 500000000n, 20000n, 2n],
+  ])('records eligible=false when %s', (_label, revenue, debtRatio, overdueCount) => {
     const simulator = new GasokEligibilitySimulator();
-    setAttestedFinancialState(simulator, 499999999n, 20000n, 1n);
+    setAttestedFinancialState(simulator, revenue, debtRatio, overdueCount);
 
     simulator.verifyEligibility(defaultPin);
 
     expect(readResult(simulator).eligible).toBe(false);
   });
 
-  it('records eligible=false when debt ratio is one basis point above the threshold', () => {
-    const simulator = new GasokEligibilitySimulator();
-    setAttestedFinancialState(simulator, 500000000n, 20001n, 1n);
-
-    simulator.verifyEligibility(defaultPin);
-
-    expect(readResult(simulator).eligible).toBe(false);
-  });
-
-  it('supports a debt ratio above Uint16 range and records it as ineligible', () => {
-    const simulator = new GasokEligibilitySimulator();
-    setAttestedFinancialState(simulator, 500000000n, 70000n, 0n);
-
-    simulator.verifyEligibility(defaultPin);
-
-    expect(readResult(simulator).eligible).toBe(false);
-  });
-
-  it('records eligible=false when overdue count is one above the threshold', () => {
-    const simulator = new GasokEligibilitySimulator();
-    setAttestedFinancialState(simulator, 500000000n, 20000n, 2n);
-
-    simulator.verifyEligibility(defaultPin);
-
-    expect(readResult(simulator).eligible).toBe(false);
-  });
-
-  it('stores only the approved public result fields', () => {
+  it('stores only eligible, provider ID, and policy version in the public result', () => {
     const simulator = new GasokEligibilitySimulator();
     setAttestedFinancialState(simulator, 900000000n, 15000n, 0n);
 
@@ -121,21 +134,90 @@ describe('GASOK financial eligibility contract', () => {
     expect('debtRatioBps' in result).toBe(false);
     expect('overdueCount' in result).toBe(false);
     expect('attestationSignature' in result).toBe(false);
+    expect('receivableId' in result).toBe(false);
+    expect('subjectRole' in result).toBe(false);
+    expect('partyWallet' in result).toBe(false);
     expect('loans' in ledger).toBe(false);
   });
 
-  it('keys the public result by a deterministic secret-and-PIN commitment', () => {
+  it('stores seller and buyer results under distinct opaque keys', () => {
+    const simulator = new GasokEligibilitySimulator();
+    const seller = createGiwaReceivableSubject(
+      7n,
+      SELLER_ROLE,
+      evmAddressToBytes(SELLER_WALLET_HEX),
+    );
+    const buyer = createGiwaReceivableSubject(
+      7n,
+      BUYER_ROLE,
+      evmAddressToBytes(BUYER_WALLET_HEX),
+    );
+    const secret = simulator.getPrivateState().companySecretKey;
+
+    setAttestedFinancialState(simulator, 800000000n, 10000n, 0n, { subject: seller });
+    simulator.verifyEligibility(defaultPin, seller);
+    setAttestedFinancialState(simulator, 800000000n, 10000n, 0n, { subject: buyer });
+    simulator.verifyEligibility(defaultPin, buyer);
+
+    const sellerKey = simulator.deriveReceivableEligibilityKey(secret, defaultPin, seller);
+    const buyerKey = simulator.deriveReceivableEligibilityKey(secret, defaultPin, buyer);
+    expect(sellerKey).not.toEqual(buyerKey);
+    expect(simulator.getLedger().eligibilityResults.size()).toBe(2n);
+    expect(simulator.getLedger().eligibilityResults.lookup(sellerKey).eligible).toBe(true);
+    expect(simulator.getLedger().eligibilityResults.lookup(buyerKey).eligible).toBe(true);
+  });
+
+  it('changes the lookup key for every company, GIWA context, and Midnight deployment input', () => {
     const simulator = new GasokEligibilitySimulator();
     const secret = simulator.companySecretKey;
+    const subject = createGiwaReceivableSubject();
+    const otherId = createGiwaReceivableSubject(2n, subject.subjectRole, subject.partyWallet);
+    const otherRole = createGiwaReceivableSubject(1n, BUYER_ROLE, subject.partyWallet);
+    const otherWallet = createGiwaReceivableSubject(
+      1n,
+      SELLER_ROLE,
+      evmAddressToBytes(BUYER_WALLET_HEX),
+    );
+    const otherGiwaContract = evmAddressToBytes('0x3333333333333333333333333333333333333333');
+    const otherMidnightDeployment = uint256ToBytes(42n);
 
-    const first = simulator.deriveCompanyCommitment(secret, defaultPin);
-    const second = simulator.deriveCompanyCommitment(secret, defaultPin);
-    const otherPin = simulator.deriveCompanyCommitment(secret, 4321n);
-    const otherSecret = simulator.deriveCompanyCommitment(simulator.generateCompanySecret(), defaultPin);
+    const keys = [
+      simulator.deriveReceivableEligibilityKey(secret, defaultPin, subject),
+      simulator.deriveReceivableEligibilityKey(secret, defaultPin, otherId),
+      simulator.deriveReceivableEligibilityKey(secret, defaultPin, otherRole),
+      simulator.deriveReceivableEligibilityKey(secret, defaultPin, otherWallet),
+      simulator.deriveReceivableEligibilityKey(secret, defaultPin, subject, {
+        giwaChainId: GIWA_CHAIN_ID + 1n,
+      }),
+      simulator.deriveReceivableEligibilityKey(secret, defaultPin, subject, {
+        receivableFinanceAddress: otherGiwaContract,
+      }),
+      simulator.deriveReceivableEligibilityKey(secret, defaultPin, subject, {
+        midnightContractAddressBytes: otherMidnightDeployment,
+      }),
+      simulator.deriveReceivableEligibilityKey(simulator.generateCompanySecret(), defaultPin, subject),
+      simulator.deriveReceivableEligibilityKey(secret, 4321n, subject),
+    ];
+    const keyHexes = keys.map((key) => Buffer.from(key).toString('hex'));
 
-    expect(first).toEqual(second);
-    expect(first).not.toEqual(otherPin);
-    expect(first).not.toEqual(otherSecret);
+    expect(new Set(keyHexes).size).toBe(keys.length);
+  });
+
+  it('round-trips and hashes the maximum uint256 receivable ID', () => {
+    const simulator = new GasokEligibilitySimulator();
+    const maxBytes = uint256ToBytes(UINT256_MAX);
+    const maxSubject = createGiwaReceivableSubject(UINT256_MAX);
+    const previousSubject = createGiwaReceivableSubject(UINT256_MAX - 1n);
+
+    expect(maxBytes).toHaveLength(32);
+    expect([...maxBytes]).toEqual(new Array<number>(32).fill(255));
+    expect(bytesToUint256(maxBytes)).toBe(UINT256_MAX);
+    expect(simulator.deriveGiwaReceivableBindingHash(maxSubject)).toEqual(
+      simulator.deriveGiwaReceivableBindingHash(maxSubject),
+    );
+    expect(simulator.deriveGiwaReceivableBindingHash(maxSubject)).not.toEqual(
+      simulator.deriveGiwaReceivableBindingHash(previousSubject),
+    );
   });
 
   it.each([
@@ -146,6 +228,42 @@ describe('GASOK financial eligibility contract', () => {
     const simulator = new GasokEligibilitySimulator();
     setAttestedFinancialState(simulator, 500000000n, 20000n, 1n);
     simulator.setPrivateState({ ...simulator.getPrivateState(), ...mutation });
+
+    expect(() => simulator.verifyEligibility(defaultPin)).toThrow();
+    expect(simulator.getLedger().eligibilityResults.size()).toBe(0n);
+  });
+
+  it.each([
+    [
+      'receivable ID',
+      () => createGiwaReceivableSubject(2n, SELLER_ROLE, evmAddressToBytes(SELLER_WALLET_HEX)),
+    ],
+    [
+      'seller/buyer role',
+      () => createGiwaReceivableSubject(1n, BUYER_ROLE, evmAddressToBytes(SELLER_WALLET_HEX)),
+    ],
+    [
+      'party wallet',
+      () => createGiwaReceivableSubject(1n, SELLER_ROLE, evmAddressToBytes(BUYER_WALLET_HEX)),
+    ],
+  ])('rejects replay under a different %s', (_label, createAlteredSubject) => {
+    const simulator = new GasokEligibilitySimulator();
+    setAttestedFinancialState(simulator, 800000000n, 10000n, 0n);
+
+    expect(() => simulator.verifyEligibility(defaultPin, createAlteredSubject())).toThrow();
+    expect(simulator.getLedger().eligibilityResults.size()).toBe(0n);
+  });
+
+  it.each([
+    ['GIWA chain', { giwaChainId: GIWA_CHAIN_ID + 1n }],
+    [
+      'ReceivableFinance contract',
+      { receivableFinanceAddress: evmAddressToBytes('0x3333333333333333333333333333333333333333') },
+    ],
+    ['Midnight deployment', { midnightContractAddressBytes: uint256ToBytes(42n) }],
+  ])('rejects an attestation signed for a different %s', (_label, signedContext) => {
+    const simulator = new GasokEligibilitySimulator();
+    setAttestedFinancialState(simulator, 800000000n, 10000n, 0n, signedContext);
 
     expect(() => simulator.verifyEligibility(defaultPin)).toThrow();
     expect(simulator.getLedger().eligibilityResults.size()).toBe(0n);
@@ -169,6 +287,47 @@ describe('GASOK financial eligibility contract', () => {
 
     expect(() => simulator.verifyEligibility(defaultPin)).toThrow();
     expect(simulator.getLedger().eligibilityResults.size()).toBe(0n);
+  });
+
+  it('rejects an exact replay before evaluating the private witness again', () => {
+    const simulator = new GasokEligibilitySimulator();
+    setAttestedFinancialState(simulator, 800000000n, 10000n, 0n);
+
+    simulator.verifyEligibility(defaultPin);
+
+    expect(() => simulator.verifyEligibility(defaultPin)).toThrow('Eligibility result already exists');
+    expect(simulator.getLedger().eligibilityResults.size()).toBe(1n);
+  });
+
+  it.each([0n, 3n, 255n])('rejects invalid subject role %s', (invalidRole) => {
+    const simulator = new GasokEligibilitySimulator();
+    const invalidSubject = createGiwaReceivableSubject(
+      1n,
+      invalidRole,
+      evmAddressToBytes(SELLER_WALLET_HEX),
+    );
+
+    expect(() => simulator.deriveGiwaReceivableBindingHash(invalidSubject)).toThrow(
+      'Subject role must be SELLER or BUYER',
+    );
+  });
+
+  it('rejects a zero receivable ID', () => {
+    const simulator = new GasokEligibilitySimulator();
+    const invalidSubject = createGiwaReceivableSubject(0n);
+
+    expect(() => simulator.deriveGiwaReceivableBindingHash(invalidSubject)).toThrow(
+      'GIWA receivable ID must be positive',
+    );
+  });
+
+  it('rejects a zero party wallet', () => {
+    const simulator = new GasokEligibilitySimulator();
+    const invalidSubject = createGiwaReceivableSubject(1n, SELLER_ROLE, new Uint8Array(20));
+
+    expect(() => simulator.deriveGiwaReceivableBindingHash(invalidSubject)).toThrow(
+      'GIWA party wallet must not be zero',
+    );
   });
 
   it('rejects an attestation from an unregistered provider ID', () => {
@@ -206,6 +365,47 @@ describe('GASOK financial eligibility contract', () => {
     });
   });
 
+  it('rejects the identity provider key that would make any message signature forgeable', () => {
+    const simulator = new GasokEligibilitySimulator();
+    const identityProviderKey = ecMulGenerator(0n);
+    const forgedResponse = 7n;
+    const forgedAnnouncement = ecMulGenerator(forgedResponse);
+    const arbitraryMessage = [1n, 2n, 3n, 4n, 5n, 6n, 2n, 1n];
+    const challenge = pureCircuits.schnorrChallenge(
+      forgedAnnouncement.x,
+      forgedAnnouncement.y,
+      identityProviderKey.x,
+      identityProviderKey.y,
+      arbitraryMessage,
+    ) % TWO_248;
+
+    // With the identity public key, the verifier equation holds without a
+    // secret because c * identity is still identity and R was chosen as sG.
+    const lhs = ecMulGenerator(forgedResponse);
+    const rhs = ecAdd(forgedAnnouncement, ecMul(identityProviderKey, challenge));
+    expect({ x: identityProviderKey.x, y: identityProviderKey.y }).toEqual({ x: 0n, y: 1n });
+    expect({ x: lhs.x, y: lhs.y }).toEqual({ x: rhs.x, y: rhs.y });
+
+    expect(() => simulator.registerProvider(2n, identityProviderKey)).toThrow(
+      'Provider public key must not be the Jubjub identity',
+    );
+    expect(simulator.getLedger().providers.member(2n)).toBe(false);
+  });
+
+  it('rejects provider-ID tampering even when both providers are registered', () => {
+    const simulator = new GasokEligibilitySimulator();
+    const secondProvider = generateProviderKeyPair();
+    simulator.registerProvider(2n, secondProvider.pk);
+    setAttestedFinancialState(simulator, 800000000n, 10000n, 0n);
+    simulator.setPrivateState({
+      ...simulator.getPrivateState(),
+      attestationProviderId: 2n,
+    });
+
+    expect(() => simulator.verifyEligibility(defaultPin)).toThrow();
+    expect(simulator.getLedger().eligibilityResults.size()).toBe(0n);
+  });
+
   it('prevents a non-admin company secret from registering a provider', () => {
     const simulator = new GasokEligibilitySimulator();
     simulator.setCompanySecret(simulator.generateCompanySecret());
@@ -226,5 +426,12 @@ describe('GASOK financial eligibility contract', () => {
 
     expect(simulator.getLedger().providers.member(2n)).toBe(true);
     expect(simulator.getLedger().contractAdmin).toEqual(newAdminPublicKey);
+  });
+
+  it('seals the configured local GIWA chain and ReceivableFinance address at deployment', () => {
+    const simulator = new GasokEligibilitySimulator();
+
+    expect(simulator.getLedger().giwaChainId).toBe(GIWA_CHAIN_ID);
+    expect(simulator.getLedger().receivableFinanceAddress).toEqual(RECEIVABLE_FINANCE_ADDRESS);
   });
 });

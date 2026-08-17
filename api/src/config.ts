@@ -5,7 +5,10 @@ export const INDEXER_HTTP_URL = 'http://127.0.0.1:8088/api/v4/graphql' as const;
 export const INDEXER_WS_URL = 'ws://127.0.0.1:8088/api/v4/graphql/ws' as const;
 export const INDEXER_QUERY_TIMEOUT_MS = 10_000;
 export const DEFAULT_GASOK_CONTRACT_ADDRESS =
-  '59c5528783708cb1535bf0dfbb36af765bfd9ae21c85f36737d6297436a5c643' as const;
+  '7e3ea9d741ce0f5862db6f46d0ad720be2586cd7d0405ec77e4a0478aa50f4fb' as const;
+export const GIWA_CHAIN_ID = 91_342n;
+export const GIWA_RECEIVABLE_FINANCE_ADDRESS =
+  '0x0f264334f98ba0d22f7fc6bb901a5fa36158a315' as const;
 
 const CONTRACT_ADDRESS = /^[0-9a-fA-F]{64}$/;
 

@@ -5,9 +5,20 @@ export type EligibilityResult = { eligible: boolean;
                                   policyVersion: bigint
                                 };
 
+export type GiwaReceivableSubject = { receivableId: Uint8Array;
+                                      subjectRole: bigint;
+                                      partyWallet: Uint8Array
+                                    };
+
 export type CompanySecretKey = Uint8Array;
 
 export type CompanyCommitment = Uint8Array;
+
+export type GiwaReceivableBindingHash = Uint8Array;
+
+export type ReceivableEligibilityKey = Uint8Array;
+
+export type MidnightDeploymentHash = Uint8Array;
 
 export type AdminPublicKey = Uint8Array;
 
@@ -29,7 +40,8 @@ export type Witnesses<PS> = {
 
 export type ImpureCircuits<PS> = {
   verifyEligibility(context: __compactRuntime.CircuitContext<PS>,
-                    secretPin_0: bigint): __compactRuntime.CircuitResults<PS, []>;
+                    secretPin_0: bigint,
+                    subject_0: GiwaReceivableSubject): __compactRuntime.CircuitResults<PS, []>;
   registerProvider(context: __compactRuntime.CircuitContext<PS>,
                    providerId_0: bigint,
                    providerPk_0: __compactRuntime.JubjubPoint): __compactRuntime.CircuitResults<PS, []>;
@@ -41,7 +53,8 @@ export type ImpureCircuits<PS> = {
 
 export type ProvableCircuits<PS> = {
   verifyEligibility(context: __compactRuntime.CircuitContext<PS>,
-                    secretPin_0: bigint): __compactRuntime.CircuitResults<PS, []>;
+                    secretPin_0: bigint,
+                    subject_0: GiwaReceivableSubject): __compactRuntime.CircuitResults<PS, []>;
   registerProvider(context: __compactRuntime.CircuitContext<PS>,
                    providerId_0: bigint,
                    providerPk_0: __compactRuntime.JubjubPoint): __compactRuntime.CircuitResults<PS, []>;
@@ -54,6 +67,13 @@ export type ProvableCircuits<PS> = {
 export type PureCircuits = {
   deriveCompanyCommitment(sk_0: CompanySecretKey, pin_0: bigint): CompanyCommitment;
   deriveAdminPublicKey(sk_0: CompanySecretKey): AdminPublicKey;
+  deriveGiwaReceivableBindingHash(configuredGiwaChainId_0: bigint,
+                                  configuredReceivableFinanceAddress_0: Uint8Array,
+                                  subject_0: GiwaReceivableSubject): GiwaReceivableBindingHash;
+  deriveMidnightDeploymentHash(contractAddress_0: Uint8Array): MidnightDeploymentHash;
+  deriveReceivableEligibilityKey(companyCommitment_0: CompanyCommitment,
+                                 bindingHash_0: GiwaReceivableBindingHash,
+                                 deploymentHash_0: MidnightDeploymentHash): ReceivableEligibilityKey;
   schnorrChallenge(ann_x_0: bigint,
                    ann_y_0: bigint,
                    pk_x_0: bigint,
@@ -67,8 +87,19 @@ export type Circuits<PS> = {
                           pin_0: bigint): __compactRuntime.CircuitResults<PS, CompanyCommitment>;
   deriveAdminPublicKey(context: __compactRuntime.CircuitContext<PS>,
                        sk_0: CompanySecretKey): __compactRuntime.CircuitResults<PS, AdminPublicKey>;
+  deriveGiwaReceivableBindingHash(context: __compactRuntime.CircuitContext<PS>,
+                                  configuredGiwaChainId_0: bigint,
+                                  configuredReceivableFinanceAddress_0: Uint8Array,
+                                  subject_0: GiwaReceivableSubject): __compactRuntime.CircuitResults<PS, GiwaReceivableBindingHash>;
+  deriveMidnightDeploymentHash(context: __compactRuntime.CircuitContext<PS>,
+                               contractAddress_0: Uint8Array): __compactRuntime.CircuitResults<PS, MidnightDeploymentHash>;
+  deriveReceivableEligibilityKey(context: __compactRuntime.CircuitContext<PS>,
+                                 companyCommitment_0: CompanyCommitment,
+                                 bindingHash_0: GiwaReceivableBindingHash,
+                                 deploymentHash_0: MidnightDeploymentHash): __compactRuntime.CircuitResults<PS, ReceivableEligibilityKey>;
   verifyEligibility(context: __compactRuntime.CircuitContext<PS>,
-                    secretPin_0: bigint): __compactRuntime.CircuitResults<PS, []>;
+                    secretPin_0: bigint,
+                    subject_0: GiwaReceivableSubject): __compactRuntime.CircuitResults<PS, []>;
   registerProvider(context: __compactRuntime.CircuitContext<PS>,
                    providerId_0: bigint,
                    providerPk_0: __compactRuntime.JubjubPoint): __compactRuntime.CircuitResults<PS, []>;
@@ -88,9 +119,9 @@ export type Ledger = {
   eligibilityResults: {
     isEmpty(): boolean;
     size(): bigint;
-    member(key_0: CompanyCommitment): boolean;
-    lookup(key_0: CompanyCommitment): EligibilityResult;
-    [Symbol.iterator](): Iterator<[CompanyCommitment, EligibilityResult]>
+    member(key_0: ReceivableEligibilityKey): boolean;
+    lookup(key_0: ReceivableEligibilityKey): EligibilityResult;
+    [Symbol.iterator](): Iterator<[ReceivableEligibilityKey, EligibilityResult]>
   };
   readonly contractAdmin: AdminPublicKey;
   providers: {
@@ -100,6 +131,8 @@ export type Ledger = {
     lookup(key_0: bigint): __compactRuntime.JubjubPoint;
     [Symbol.iterator](): Iterator<[bigint, __compactRuntime.JubjubPoint]>
   };
+  readonly giwaChainId: bigint;
+  readonly receivableFinanceAddress: Uint8Array;
 }
 
 export type ContractReferenceLocations = any;
@@ -112,7 +145,9 @@ export declare class Contract<PS = any, W extends Witnesses<PS> = Witnesses<PS>>
   impureCircuits: ImpureCircuits<PS>;
   provableCircuits: ProvableCircuits<PS>;
   constructor(witnesses: W);
-  initialState(context: __compactRuntime.ConstructorContext<PS>): __compactRuntime.ConstructorResult<PS>;
+  initialState(context: __compactRuntime.ConstructorContext<PS>,
+               configuredGiwaChainId_0: bigint,
+               configuredReceivableFinanceAddress_0: Uint8Array): __compactRuntime.ConstructorResult<PS>;
 }
 
 export declare function ledger(state: __compactRuntime.StateValue | __compactRuntime.ChargedState): Ledger;

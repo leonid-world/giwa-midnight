@@ -1,7 +1,15 @@
 import { GasokEligibility } from 'zkloan-credit-scorer-contract';
-import { contractNotFound, indexerUnavailable, invalidContractState } from './errors.js';
-import { NETWORK_ID } from './config.js';
-import type { EligibilityResultsJson } from './types.js';
+import {
+  GIWA_CHAIN_ID,
+  GIWA_RECEIVABLE_FINANCE_ADDRESS,
+} from './config.js';
+import {
+  contractNotFound,
+  eligibilityResultNotFound,
+  indexerUnavailable,
+  invalidContractState,
+  PublicApiError,
+} from './errors.js';
 
 interface PublicEligibilityResult {
   readonly eligible: boolean;
@@ -9,8 +17,21 @@ interface PublicEligibilityResult {
   readonly policyVersion: bigint;
 }
 
+interface PublicEligibilityMap {
+  member(key: Uint8Array): boolean;
+  lookup(key: Uint8Array): PublicEligibilityResult;
+}
+
 interface PublicEligibilityLedger {
-  readonly eligibilityResults: Iterable<readonly [Uint8Array, PublicEligibilityResult]>;
+  readonly eligibilityResults: PublicEligibilityMap;
+  readonly giwaChainId: bigint;
+  readonly receivableFinanceAddress: Uint8Array;
+}
+
+export interface ExactEligibilityResult {
+  readonly eligible: boolean;
+  readonly providerId: string;
+  readonly policyVersion: string;
 }
 
 export type QueryContractState = (
@@ -24,7 +45,10 @@ export interface EligibilityReaderDependencies {
   readonly decodeLedger?: DecodeLedger;
 }
 
-export type GetEligibilityResults = (contractAddress: string) => Promise<EligibilityResultsJson>;
+export type GetEligibilityResult = (
+  contractAddress: string,
+  lookupKey: Uint8Array,
+) => Promise<ExactEligibilityResult>;
 
 const decodeGasokEligibilityLedger: DecodeLedger = (data) =>
   GasokEligibility.ledger(data as Parameters<typeof GasokEligibility.ledger>[0]);
@@ -36,8 +60,8 @@ function bytesToHex(value: Uint8Array): string {
 export function createEligibilityReader({
   queryContractState,
   decodeLedger = decodeGasokEligibilityLedger,
-}: EligibilityReaderDependencies): GetEligibilityResults {
-  return async (contractAddress) => {
+}: EligibilityReaderDependencies): GetEligibilityResult {
+  return async (contractAddress, lookupKey) => {
     let state: Awaited<ReturnType<QueryContractState>>;
     try {
       state = await queryContractState(contractAddress);
@@ -52,21 +76,38 @@ export function createEligibilityReader({
     let ledger: PublicEligibilityLedger;
     try {
       ledger = decodeLedger(state.data);
+      if (
+        ledger.giwaChainId !== GIWA_CHAIN_ID ||
+        `0x${bytesToHex(ledger.receivableFinanceAddress)}` !== GIWA_RECEIVABLE_FINANCE_ADDRESS
+      ) {
+        throw new Error('Unexpected GIWA deployment configuration');
+      }
     } catch {
       throw invalidContractState();
     }
 
-    const results = Array.from(ledger.eligibilityResults, ([commitment, result]) => ({
-      commitment: bytesToHex(commitment),
-      eligible: result.eligible,
-      providerId: result.providerId.toString(),
-      policyVersion: result.policyVersion.toString(),
-    })).sort((left, right) => left.commitment.localeCompare(right.commitment));
-
-    return {
-      networkId: NETWORK_ID,
-      contractAddress,
-      results,
-    };
+    try {
+      if (!ledger.eligibilityResults.member(lookupKey)) {
+        throw eligibilityResultNotFound();
+      }
+      const result = ledger.eligibilityResults.lookup(lookupKey);
+      if (
+        typeof result.eligible !== 'boolean' ||
+        typeof result.providerId !== 'bigint' ||
+        typeof result.policyVersion !== 'bigint'
+      ) {
+        throw new Error('Malformed eligibility result');
+      }
+      return {
+        eligible: result.eligible,
+        providerId: result.providerId.toString(),
+        policyVersion: result.policyVersion.toString(),
+      };
+    } catch (error: unknown) {
+      if (error instanceof PublicApiError) {
+        throw error;
+      }
+      throw invalidContractState();
+    }
   };
 }

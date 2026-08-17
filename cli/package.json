@@ -8,6 +8,7 @@
   "scripts": {
     "preprod-remote": "node --experimental-specifier-resolution=node --loader ts-node/esm src/preprod-remote.ts",
     "standalone": "node --experimental-specifier-resolution=node --loader ts-node/esm src/standalone.ts",
+    "proof-bridge": "node --experimental-specifier-resolution=node --loader ts-node/esm src/standalone-proof-bridge.ts",
     "test-api": "docker compose -f standalone.yml pull && DEBUG='testcontainers' vitest run",
     "test-against-preprod": "RUN_ENV_TESTS=true TEST_ENV=preprod TEST_WALLET_SEED=1dec0dd58fbe4d3206ef960aebff95a77e09dffbd19f3e9439d23fe6de4fcdd1 vitest run",
     "build": "rm -rf dist && tsc --project tsconfig.build.json",
@@ -16,6 +17,7 @@
     "start-preprod-remote": "npm run build && npm run preprod-remote"
   },
   "dependencies": {
+    "ethers": "^6.17.0",
     "zkloan-credit-scorer-contract": "*"
   }
 }

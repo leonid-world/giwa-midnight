@@ -12,10 +12,11 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "zkloan-credit-scorer-contract": "0.1.0",
     "@midnight-ntwrk/midnight-js-network-id": "4.1.1",
     "@midnight-ntwrk/midnight-js-protocol": "4.1.1",
-    "restify": "^11.1.0"
+    "ethers": "^6.17.0",
+    "restify": "^11.1.0",
+    "zkloan-credit-scorer-contract": "0.1.0"
   },
   "devDependencies": {
     "@types/restify": "^8.5.12",

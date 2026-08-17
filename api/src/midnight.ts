@@ -7,8 +7,8 @@ import {
   INDEXER_WS_URL,
   NETWORK_ID,
 } from './config.js';
-import { createEligibilityReader, type GetEligibilityResults, type QueryContractState } from './eligibility.js';
-import { withTimeout } from './timeout.js';
+import { createEligibilityReader, type GetEligibilityResult, type QueryContractState } from './eligibility.js';
+import { createSingleInFlightOperation } from './timeout.js';
 
 function installNodeWebSocket(): void {
   if (globalThis.WebSocket === undefined) {
@@ -16,18 +16,18 @@ function installNodeWebSocket(): void {
   }
 }
 
-export function createLocalEligibilityReader(): GetEligibilityResults {
+export function createLocalEligibilityReader(): GetEligibilityResult {
   setNetworkId(NETWORK_ID);
   installNodeWebSocket();
 
   const provider = indexerPublicDataProvider(INDEXER_HTTP_URL, INDEXER_WS_URL);
-  const queryContractState: QueryContractState = async (contractAddress) =>
-    withTimeout(
+  const queryContractState: QueryContractState = createSingleInFlightOperation(
+    async (contractAddress: string) =>
       provider.queryContractState(
         contractAddress as Parameters<typeof provider.queryContractState>[0],
       ),
-      INDEXER_QUERY_TIMEOUT_MS,
-    );
+    INDEXER_QUERY_TIMEOUT_MS,
+  );
 
   return createEligibilityReader({ queryContractState });
 }

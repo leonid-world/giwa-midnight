@@ -1,6 +1,14 @@
 import { describe, it, expect } from 'vitest';
 import { setNetworkId } from '@midnight-ntwrk/midnight-js-network-id';
-import { sign, generateKeyPair, signFinancialData } from '../src/signing.js';
+import {
+  buildFinancialAttestationMessage,
+  sign,
+  generateKeyPair,
+  getPublicKey,
+  parseProviderSecretKey,
+  requireValidProviderSecretKey,
+  signFinancialData,
+} from '../src/signing.js';
 import { ecMulGenerator, ecMul, ecAdd } from '@midnight-ntwrk/midnight-js-protocol/compact-runtime';
 import { GasokEligibility } from 'zkloan-credit-scorer-contract';
 const { pureCircuits } = GasokEligibility;
@@ -19,9 +27,33 @@ describe('Schnorr signing', () => {
     expect(pk.y).toBeDefined();
   });
 
+  it('preserves the configured provider key 2 without modulo reduction', () => {
+    expect(parseProviderSecretKey('2')).toBe(2n);
+    expect(parseProviderSecretKey('0x02')).toBe(2n);
+    expect(getPublicKey(2n)).toEqual(ecMulGenerator(2n));
+  });
+
+  it.each([0n, -1n, JUBJUB_ORDER, JUBJUB_ORDER + 1n])(
+    'rejects invalid provider secret key %s instead of reducing it modulo the group order',
+    (invalidSecretKey) => {
+      expect(() => requireValidProviderSecretKey(invalidSecretKey)).toThrow(
+        'Provider secret key must be between 1 and the Jubjub order minus 1',
+      );
+      expect(() => getPublicKey(invalidSecretKey)).toThrow();
+      expect(() => sign(invalidSecretKey, [1n, 2n, 3n, 4n, 5n, 6n, 7n, 8n])).toThrow();
+    },
+  );
+
+  it.each(['0', JUBJUB_ORDER.toString(16), 'f'.repeat(65), 'not-hex', ''])(
+    'rejects invalid configured key %s',
+    (value) => {
+      expect(() => parseProviderSecretKey(value)).toThrow();
+    },
+  );
+
   it('produces signatures that verify correctly', () => {
     const { sk, pk } = generateKeyPair();
-    const msg = [1n, 2n, 3n, 4n];
+    const msg = [1n, 2n, 3n, 4n, 5n, 6n, 7n, 8n];
     const sig = sign(sk, msg);
 
     // Manual verification: G*s == R + P*c
@@ -41,8 +73,8 @@ describe('Schnorr signing', () => {
 
   it('produces different signatures for different messages', () => {
     const { sk } = generateKeyPair();
-    const msg1 = [1n, 2n, 3n, 4n];
-    const msg2 = [5n, 6n, 7n, 8n];
+    const msg1 = [1n, 2n, 3n, 4n, 5n, 6n, 7n, 8n];
+    const msg2 = [8n, 7n, 6n, 5n, 4n, 3n, 2n, 1n];
 
     const sig1 = sign(sk, msg1);
     const sig2 = sign(sk, msg2);
@@ -54,11 +86,44 @@ describe('Schnorr signing', () => {
   it('signFinancialData signs GASOK fields in contract order', () => {
     const { sk, pk } = generateKeyPair();
     const companyCommitmentHash = 12345678901234567890n;
+    const bindingHashField = 555n;
+    const deploymentHashField = 666n;
+    const providerId = 42n;
+    const policyVersion = 1n;
 
-    const sig = signFinancialData(sk, 500_000_000n, 20_000n, 1n, companyCommitmentHash);
+    const sig = signFinancialData(
+      sk,
+      500_000_000n,
+      20_000n,
+      1n,
+      companyCommitmentHash,
+      bindingHashField,
+      deploymentHashField,
+      providerId,
+      policyVersion,
+    );
 
     // Verify manually
-    const msg: [bigint, bigint, bigint, bigint] = [500_000_000n, 20_000n, 1n, companyCommitmentHash];
+    const msg = buildFinancialAttestationMessage(
+      500_000_000n,
+      20_000n,
+      1n,
+      companyCommitmentHash,
+      bindingHashField,
+      deploymentHashField,
+      providerId,
+      policyVersion,
+    );
+    expect(msg).toEqual([
+      500_000_000n,
+      20_000n,
+      1n,
+      companyCommitmentHash,
+      bindingHashField,
+      deploymentHashField,
+      providerId,
+      policyVersion,
+    ]);
     const cFull = pureCircuits.schnorrChallenge(
       sig.announcement.x, sig.announcement.y,
       pk.x, pk.y,
@@ -75,7 +140,7 @@ describe('Schnorr signing', () => {
 
   it('signature response is within Jubjub scalar field', () => {
     const { sk } = generateKeyPair();
-    const msg = [100n, 200n, 300n, 400n];
+    const msg = [100n, 200n, 300n, 400n, 500n, 600n, 700n, 800n];
 
     for (let i = 0; i < 10; i++) {
       const sig = sign(sk, msg);
@@ -85,8 +150,9 @@ describe('Schnorr signing', () => {
   });
 
   it('challenge hash is deterministic for same inputs', () => {
-    const cFull1 = pureCircuits.schnorrChallenge(1n, 2n, 3n, 4n, [5n, 6n, 7n, 8n]);
-    const cFull2 = pureCircuits.schnorrChallenge(1n, 2n, 3n, 4n, [5n, 6n, 7n, 8n]);
+    const message = [5n, 6n, 7n, 8n, 9n, 10n, 11n, 12n];
+    const cFull1 = pureCircuits.schnorrChallenge(1n, 2n, 3n, 4n, message);
+    const cFull2 = pureCircuits.schnorrChallenge(1n, 2n, 3n, 4n, message);
     expect(cFull1).toEqual(cFull2);
   });
 });

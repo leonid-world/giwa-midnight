@@ -3,9 +3,97 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { type GasokEligibilityPrivateState } from '../../witnesses.js';
-import { pureCircuits, type Schnorr_SchnorrSignature } from '../../managed/zkloan-credit-scorer/contract/index.js';
+import {
+  pureCircuits,
+  type GiwaReceivableSubject,
+  type Schnorr_SchnorrSignature,
+} from '../../managed/zkloan-credit-scorer/contract/index.js';
 import { ecMulGenerator, type JubjubPoint } from '@midnight-ntwrk/midnight-js-protocol/compact-runtime';
 import * as crypto from 'crypto';
+
+export const UINT256_MAX = (1n << 256n) - 1n;
+export const GIWA_CHAIN_ID = 91342n;
+export const RECEIVABLE_FINANCE_ADDRESS_HEX = '0x0f264334f98BA0d22f7Fc6Bb901a5Fa36158a315';
+export const SELLER_ROLE = 1n;
+export const BUYER_ROLE = 2n;
+export const SELLER_WALLET_HEX = '0x1111111111111111111111111111111111111111';
+export const BUYER_WALLET_HEX = '0x2222222222222222222222222222222222222222';
+export const POLICY_VERSION = 1n;
+
+export function uint256ToBytes(value: bigint): Uint8Array {
+  if (value < 0n || value > UINT256_MAX) {
+    throw new RangeError('uint256 value must be between 0 and 2^256 - 1');
+  }
+
+  return Uint8Array.from(Buffer.from(value.toString(16).padStart(64, '0'), 'hex'));
+}
+
+export function bytesToUint256(bytes: Uint8Array): bigint {
+  if (bytes.length !== 32) {
+    throw new RangeError('uint256 byte representation must contain exactly 32 bytes');
+  }
+
+  return BigInt(`0x${Buffer.from(bytes).toString('hex')}`);
+}
+
+export function evmAddressToBytes(address: string): Uint8Array {
+  if (!/^0x[0-9a-fA-F]{40}$/.test(address)) {
+    throw new Error('EVM address must be a 0x-prefixed 20-byte hexadecimal value');
+  }
+
+  return Uint8Array.from(Buffer.from(address.slice(2), 'hex'));
+}
+
+export const RECEIVABLE_FINANCE_ADDRESS = evmAddressToBytes(RECEIVABLE_FINANCE_ADDRESS_HEX);
+
+export function createGiwaReceivableSubject(
+  receivableId: bigint = 1n,
+  subjectRole: bigint = SELLER_ROLE,
+  partyWallet: Uint8Array = evmAddressToBytes(SELLER_WALLET_HEX),
+): GiwaReceivableSubject {
+  return {
+    receivableId: uint256ToBytes(receivableId),
+    subjectRole,
+    partyWallet: Uint8Array.from(partyWallet),
+  };
+}
+
+export type FinancialAttestationMessage = [
+  annualRevenueKrw: bigint,
+  debtRatioBps: bigint,
+  overdueCount: bigint,
+  companyCommitmentHash: bigint,
+  giwaReceivableBindingHash: bigint,
+  midnightDeploymentHash: bigint,
+  providerId: bigint,
+  policyVersion: bigint,
+];
+
+export type FinancialAttestationBinding = {
+  companyCommitmentHash: bigint;
+  giwaReceivableBindingHash: bigint;
+  midnightDeploymentHash: bigint;
+  providerId?: bigint;
+  policyVersion?: bigint;
+};
+
+export function buildFinancialAttestationMessage(
+  annualRevenueKrw: bigint,
+  debtRatioBps: bigint,
+  overdueCount: bigint,
+  binding: FinancialAttestationBinding,
+): FinancialAttestationMessage {
+  return [
+    annualRevenueKrw,
+    debtRatioBps,
+    overdueCount,
+    binding.companyCommitmentHash,
+    binding.giwaReceivableBindingHash,
+    binding.midnightDeploymentHash,
+    binding.providerId ?? 1n,
+    binding.policyVersion ?? POLICY_VERSION,
+  ];
+}
 
 export const financialProfiles = [
   {
@@ -79,11 +167,16 @@ export function createSignedFinancialProfile(
   debtRatioBps: bigint,
   overdueCount: bigint,
   providerSk: bigint,
-  companyCommitmentHash: bigint,
-  providerId: bigint = 1n,
+  binding: FinancialAttestationBinding,
   companySecretKey: Uint8Array = generateCompanySecret(),
 ): GasokEligibilityPrivateState {
-  const message = [annualRevenueKrw, debtRatioBps, overdueCount, companyCommitmentHash];
+  const providerId = binding.providerId ?? 1n;
+  const message = buildFinancialAttestationMessage(
+    annualRevenueKrw,
+    debtRatioBps,
+    overdueCount,
+    binding,
+  );
 
   return {
     annualRevenueKrw,
@@ -98,8 +191,7 @@ export function createSignedFinancialProfile(
 export function createSignedFinancialProfileFromFixture(
   index: number,
   providerSk: bigint,
-  companyCommitmentHash: bigint,
-  providerId: bigint = 1n,
+  binding: FinancialAttestationBinding,
   companySecretKey: Uint8Array = generateCompanySecret(),
 ): GasokEligibilityPrivateState {
   const profile = financialProfiles[index];
@@ -112,8 +204,7 @@ export function createSignedFinancialProfileFromFixture(
     profile.debtRatioBps,
     profile.overdueCount,
     providerSk,
-    companyCommitmentHash,
-    providerId,
+    binding,
     companySecretKey,
   );
 }

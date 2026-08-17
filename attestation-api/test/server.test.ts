@@ -1,133 +1,427 @@
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { setNetworkId } from '@midnight-ntwrk/midnight-js-network-id';
-import { createServer } from '../src/server.js';
-import { generateKeyPair } from '../src/signing.js';
+import { TypedDataEncoder, Wallet } from 'ethers';
+import {
+  AUTHORIZATION_PROTOCOL,
+  AUTHORIZATION_TTL_SECONDS,
+  PROVIDER_ID,
+} from '../src/authorization.js';
+import {
+  HEADERS_TIMEOUT_MS,
+  MAX_ATTESTATION_BODY_BYTES,
+  REQUEST_TIMEOUT_MS,
+  createServer,
+} from '../src/server.js';
+import { JUBJUB_ORDER, generateKeyPair } from '../src/signing.js';
+import { DEFAULT_APPROVED_MIDNIGHT_CONTRACT_ADDRESS } from '../src/context.js';
+import {
+  GiwaReceivableNotFoundError,
+  GiwaRpcError,
+  type GiwaReceivableResolver,
+} from '../src/giwa.js';
+import type {
+  AuthorizationChallengeRequest,
+  AuthorizationChallengeResponse,
+  AuthorizationProof,
+} from '../src/types.js';
 import type restify from 'restify';
 
 setNetworkId('undeployed');
 
-describe('Attestation API Server', () => {
+const sellerWallet = new Wallet('0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d');
+const buyerWallet = new Wallet('0x8b3a350cf5c34c9194ca3a545dbe4035957f353df9e4cb8a3173f8a2f1a7e682');
+const replacementWallet = new Wallet('0x0dbbe8f54b5f35db3d10c3a87a55b7b750be7f78f50f4e83478b07a65d6e1b29');
+
+describe('Attestation API EIP-712 issuance gate', () => {
   let server: restify.Server;
   let baseUrl: string;
   const { sk, pk } = generateKeyPair();
-  const providerId = 42;
+  const midnightContractAddress = DEFAULT_APPROVED_MIDNIGHT_CONTRACT_ADDRESS;
+  let seller = sellerWallet.address.toLowerCase();
+  let buyer = buyerWallet.address.toLowerCase();
+  const resolveReceivable = vi.fn(async (receivableId: bigint) => {
+    if (receivableId === 404n) {
+      throw new GiwaReceivableNotFoundError();
+    }
+    if (receivableId === 503n) {
+      throw new GiwaRpcError('test RPC failure details must not leak');
+    }
+    return { id: receivableId, seller, buyer };
+  });
+  const resolver: GiwaReceivableResolver = { resolve: resolveReceivable };
+
+  const validRequest: AuthorizationChallengeRequest = {
+    version: 1,
+    annualRevenueKrw: '500000000',
+    debtRatioBps: '20000',
+    overdueCount: '1',
+    companyCommitmentHash: '12345678901234567890',
+    authorizationSalt: `0x${'aa'.repeat(32)}`,
+    midnightContractAddress,
+    onchainReceivableId: '7',
+    subjectRole: 'SELLER',
+  };
 
   beforeAll(async () => {
-    server = createServer(sk, providerId);
+    server = createServer(sk, {
+      receivableResolver: resolver,
+      approvedMidnightContractAddress: midnightContractAddress,
+    });
     await new Promise<void>((resolve) => {
       server.listen(0, '127.0.0.1', () => {
-        const addr = server.address();
-        const port = typeof addr === 'string' ? addr : addr?.port;
+        const address = server.address();
+        const port = typeof address === 'string' ? address : address?.port;
         baseUrl = `http://127.0.0.1:${port}`;
         resolve();
       });
     });
   });
 
+  beforeEach(() => {
+    seller = sellerWallet.address.toLowerCase();
+    buyer = buyerWallet.address.toLowerCase();
+    resolveReceivable.mockClear();
+  });
+
   afterAll(async () => {
-    await new Promise<void>((resolve) => {
-      server.close(() => resolve());
-    });
+    await new Promise<void>((resolve) => server.close(() => resolve()));
   });
 
-  it('GET /health returns ok status', async () => {
-    const res = await fetch(`${baseUrl}/health`);
-    expect(res.status).toBe(200);
-    const body = await res.json();
-    expect(body.status).toBe('ok');
-    expect(body.providerId).toBe(providerId);
-    expect(body.attestationType).toBe('mock');
-    expect(res.headers.get('access-control-allow-origin')).toBeNull();
-  });
-
-  it('GET /provider-info returns provider public key', async () => {
-    const res = await fetch(`${baseUrl}/provider-info`);
-    expect(res.status).toBe(200);
-    const body = await res.json();
-    expect(body.providerId).toBe(providerId);
-    expect(body.publicKey.x).toBe(pk.x.toString());
-    expect(body.publicKey.y).toBe(pk.y.toString());
-    expect(body.attestationType).toBe('mock');
-  });
-
-  it('POST /attest returns valid attestation', async () => {
-    const res = await fetch(`${baseUrl}/attest`, {
+  async function post(path: string, body: unknown, headers = { 'Content-Type': 'application/json' }): Promise<Response> {
+    return fetch(`${baseUrl}${path}`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        annualRevenueKrw: '500000000',
-        debtRatioBps: '20000',
-        overdueCount: '1',
-        companyCommitmentHash: '12345678901234567890',
-      }),
+      headers,
+      body: JSON.stringify(body),
     });
-    expect(res.status).toBe(200);
-    const body = await res.json();
-    expect(body.signature).toBeDefined();
-    expect(body.signature.announcement).toBeDefined();
-    expect(body.signature.announcement.x).toBeDefined();
-    expect(body.signature.announcement.y).toBeDefined();
-    expect(body.signature.response).toBeDefined();
-    expect(body.providerId).toBe(providerId);
-    expect(body.attestationType).toBe('mock');
-    expect(body.message).toBeUndefined();
-    expect(JSON.stringify(body)).not.toContain('500000000');
-    expect(JSON.stringify(body)).not.toContain('20000');
+  }
+
+  async function issueChallenge(
+    overrides: Partial<AuthorizationChallengeRequest> = {},
+  ): Promise<AuthorizationChallengeResponse> {
+    const response = await post('/authorization-challenges', { ...validRequest, ...overrides });
+    expect(response.status).toBe(201);
+    return response.json() as Promise<AuthorizationChallengeResponse>;
+  }
+
+  async function signChallenge(
+    challenge: AuthorizationChallengeResponse,
+    signer: Wallet,
+    overrides: Partial<AuthorizationProof> = {},
+  ): Promise<AuthorizationProof> {
+    const signature = await signer.signTypedData(challenge.domain, challenge.types, challenge.message);
+    return {
+      version: 1,
+      authorizationId: challenge.message.authorizationId,
+      typedDataHash: TypedDataEncoder.hash(challenge.domain, challenge.types, challenge.message),
+      signer: signer.address,
+      signature,
+      ...overrides,
+    };
+  }
+
+  async function attest(
+    challenge: AuthorizationChallengeResponse,
+    signer: Wallet = sellerWallet,
+    requestOverrides: Partial<AuthorizationChallengeRequest> = {},
+    proofOverrides: Partial<AuthorizationProof> = {},
+  ): Promise<Response> {
+    return post('/attest', {
+      ...validRequest,
+      ...requestOverrides,
+      authorization: await signChallenge(challenge, signer, proofOverrides),
+    });
+  }
+
+  it('advertises fixed Provider 2 and the EIP-712 protocol', async () => {
+    for (const path of ['/health', '/provider-info']) {
+      const response = await fetch(`${baseUrl}${path}`);
+      expect(response.status).toBe(200);
+      expect(response.headers.get('cache-control')).toBe('no-store');
+      expect(response.headers.get('access-control-allow-origin')).toBeNull();
+      const body = await response.json();
+      expect(body.providerId).toBe(PROVIDER_ID);
+      expect(body.authorizationProtocol).toBe(AUTHORIZATION_PROTOCOL);
+      expect(body.approvedMidnightContractAddress).toBe(midnightContractAddress);
+      expect(body.attestationType).toBe('mock');
+      if (path === '/provider-info') {
+        expect(body.publicKey).toEqual({ x: pk.x.toString(), y: pk.y.toString() });
+      }
+    }
   });
 
-  it('POST /attest returns 400 for missing fields', async () => {
-    const res = await fetch(`${baseUrl}/attest`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        annualRevenueKrw: '500000000',
-        // missing other fields
-      }),
-    });
-    expect(res.status).toBe(400);
-    const body = await res.json();
-    expect(body.error).toContain('debtRatioBps');
+  it('configures bounded request, header, and keep-alive timeouts', () => {
+    const nodeServer = (server as unknown as {
+      server: { requestTimeout: number; headersTimeout: number; keepAliveTimeout: number };
+    }).server;
+    expect(nodeServer.requestTimeout).toBe(REQUEST_TIMEOUT_MS);
+    expect(nodeServer.headersTimeout).toBe(HEADERS_TIMEOUT_MS);
+    expect(nodeServer.keepAliveTimeout).toBe(HEADERS_TIMEOUT_MS);
+  });
+
+  it.each([0n, JUBJUB_ORDER])('rejects invalid provider secret key %s', (invalidKey) => {
+    expect(() => createServer(invalidKey, {
+      receivableResolver: resolver,
+      approvedMidnightContractAddress: midnightContractAddress,
+    })).toThrow('Provider secret key must be between 1 and the Jubjub order minus 1');
+  });
+
+  it('returns the exact challenge wire schema without raw values or salt', async () => {
+    const before = Math.floor(Date.now() / 1_000);
+    const response = await post('/authorization-challenges', validRequest);
+    const after = Math.floor(Date.now() / 1_000);
+    expect(response.status).toBe(201);
+    expect(response.headers.get('cache-control')).toBe('no-store');
+    const body = await response.json() as AuthorizationChallengeResponse;
+
+    expect(Object.keys(body)).toEqual(['version', 'domain', 'primaryType', 'types', 'message']);
+    expect(body.version).toBe(1);
+    expect(body.domain).toEqual({ name: 'GASOK Mock Attestation', version: '1', chainId: '91342' });
+    expect(body.primaryType).toBe('GASOKRoleAttestationAuthorization');
+    expect(Object.keys(body.types)).toEqual(['GASOKRoleAttestationAuthorization']);
+    expect(body.message.providerId).toBe('2');
+    expect(body.message.policyVersion).toBe('1');
+    expect(body.message.partyWallet).toBe(seller);
+    expect(Number(body.message.issuedAt)).toBeGreaterThanOrEqual(before);
+    expect(Number(body.message.issuedAt)).toBeLessThanOrEqual(after);
+    expect(BigInt(body.message.expiresAt) - BigInt(body.message.issuedAt)).toBe(BigInt(AUTHORIZATION_TTL_SECONDS));
+    expect(body.message.authorizationId).toMatch(/^0x[0-9a-f]{64}$/);
+    expect(body.message.attestationRequestCommitment).toMatch(/^0x[0-9a-f]{64}$/);
+    expect(body.message.midnightContractAddress).toBe(`0x${midnightContractAddress}`);
+
+    const serialized = JSON.stringify(body);
+    for (const hidden of [
+      'annualRevenueKrw',
+      'debtRatioBps',
+      'overdueCount',
+      'companyCommitmentHash',
+      'authorizationSalt',
+      '500000000',
+      '12345678901234567890',
+      'aa'.repeat(32),
+    ]) {
+      expect(serialized).not.toContain(hidden);
+    }
   });
 
   it.each([
-    ['annualRevenueKrw', '-1'],
-    ['annualRevenueKrw', '18446744073709551616'],
-    ['debtRatioBps', '4294967296'],
-    ['overdueCount', '65536'],
-    ['companyCommitmentHash', '-1'],
-  ])('POST /attest returns 400 when %s is invalid', async (field, value) => {
-    const request = {
-      annualRevenueKrw: '500000000',
-      debtRatioBps: '20000',
-      overdueCount: '1',
-      companyCommitmentHash: '12345678901234567890',
-      [field]: value,
-    };
-    const res = await fetch(`${baseUrl}/attest`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(request),
+    ['SELLER', sellerWallet] as const,
+    ['BUYER', buyerWallet] as const,
+  ])('authorizes and attests the canonical %s wallet', async (subjectRole, roleWallet) => {
+    const challenge = await issueChallenge({ subjectRole });
+    const response = await attest(challenge, roleWallet, { subjectRole });
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.providerId).toBe(2);
+    expect(body.policyVersion).toBe(1);
+    expect(body.authorizationProtocol).toBe(AUTHORIZATION_PROTOCOL);
+    expect(body.binding).toEqual({
+      giwaChainId: '91342',
+      receivableFinanceAddress: '0x0f264334f98ba0d22f7fc6bb901a5fa36158a315',
+      onchainReceivableId: '7',
+      subjectRole,
+      partyWallet: roleWallet.address.toLowerCase(),
     });
+    expect(body.signature.announcement.x).toMatch(/^\d+$/);
+    expect(body.signature.announcement.y).toMatch(/^\d+$/);
+    expect(body.signature.response).toMatch(/^\d+$/);
 
-    expect(res.status).toBe(400);
-    const body = await res.json();
-    expect(body.error).toContain(field);
+    const serialized = JSON.stringify(body);
+    for (const hidden of [
+      'annualRevenueKrw',
+      'debtRatioBps',
+      'overdueCount',
+      'companyCommitmentHash',
+      'authorizationSalt',
+      'authorizationId',
+      'typedDataHash',
+    ]) {
+      expect(serialized).not.toContain(hidden);
+    }
   });
 
-  it('rejects non-string financial values instead of accepting JSON numbers', async () => {
-    const res = await fetch(`${baseUrl}/attest`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        annualRevenueKrw: 500000000,
-        debtRatioBps: '20000',
-        overdueCount: '1',
-        companyCommitmentHash: '12345678901234567890',
-      }),
+  it('preserves a uint256 maximum receivable ID', async () => {
+    const onchainReceivableId = ((1n << 256n) - 1n).toString();
+    const challenge = await issueChallenge({ onchainReceivableId });
+    const response = await attest(challenge, sellerWallet, { onchainReceivableId });
+    expect(response.status).toBe(200);
+    expect((await response.json()).binding.onchainReceivableId).toBe(onchainReceivableId);
+  });
+
+  it('consumes a challenge before rejecting a bad signature', async () => {
+    const challenge = await issueChallenge();
+    const invalid = await attest(challenge, buyerWallet);
+    expect(invalid.status).toBe(401);
+    expect(await invalid.json()).toEqual({
+      error: {
+        code: 'AUTHORIZATION_INVALID',
+        message: 'The wallet authorization is invalid or no longer available.',
+      },
     });
 
-    expect(res.status).toBe(400);
-    const body = await res.json();
-    expect(body.error).toContain('annualRevenueKrw');
+    const replay = await attest(challenge, sellerWallet);
+    expect(replay.status).toBe(401);
+    expect((await replay.json()).error.code).toBe('AUTHORIZATION_INVALID');
+  });
+
+  it.each([
+    ['financial value', { annualRevenueKrw: '500000001' }],
+    ['company commitment', { companyCommitmentHash: '999' }],
+    ['authorization salt', { authorizationSalt: `0x${'bb'.repeat(32)}` }],
+    ['Midnight deployment', { midnightContractAddress: 'bb'.repeat(32) }],
+    ['receivable ID', { onchainReceivableId: '8' }],
+    ['subject role', { subjectRole: 'BUYER' as const }],
+  ])('rejects and consumes a challenge when the %s changes', async (_label, overrides) => {
+    const challenge = await issueChallenge();
+    const response = await attest(challenge, sellerWallet, overrides);
+    expect([400, 401]).toContain(response.status);
+
+    const replay = await attest(challenge, sellerWallet);
+    expect(replay.status).toBe(401);
+  });
+
+  it('rejects typed-data hash and signer claims that do not match the reconstructed message', async () => {
+    const hashChallenge = await issueChallenge();
+    const badHash = await attest(hashChallenge, sellerWallet, {}, {
+      typedDataHash: `0x${'ff'.repeat(32)}`,
+    });
+    expect(badHash.status).toBe(401);
+
+    const signerChallenge = await issueChallenge();
+    const badSigner = await attest(signerChallenge, sellerWallet, {}, {
+      signer: buyerWallet.address,
+    });
+    expect(badSigner.status).toBe(401);
+  });
+
+  it('re-resolves GIWA and rejects a role-wallet change after challenge issuance', async () => {
+    const challenge = await issueChallenge();
+    seller = replacementWallet.address.toLowerCase();
+    const response = await attest(challenge, sellerWallet);
+    expect(response.status).toBe(401);
+    expect(resolveReceivable).toHaveBeenCalledTimes(2);
+  });
+
+  it('requires exact challenge, attestation, and authorization key sets', async () => {
+    const extraChallenge = await post('/authorization-challenges', { ...validRequest, extra: true });
+    expect(extraChallenge.status).toBe(400);
+    expect(resolveReceivable).not.toHaveBeenCalled();
+
+    const challengeForTopLevel = await issueChallenge();
+    const proofForTopLevel = await signChallenge(challengeForTopLevel, sellerWallet);
+    const extraTopLevel = await post('/attest', {
+      ...validRequest,
+      authorization: proofForTopLevel,
+      extra: true,
+    });
+    expect(extraTopLevel.status).toBe(400);
+
+    const challengeForProof = await issueChallenge();
+    const proof = await signChallenge(challengeForProof, sellerWallet);
+    const extraProof = await post('/attest', {
+      ...validRequest,
+      authorization: { ...proof, extra: true },
+    });
+    expect(extraProof.status).toBe(400);
+  });
+
+  it.each([
+    ['zero ID', { onchainReceivableId: '0' }],
+    ['negative ID', { onchainReceivableId: '-1' }],
+    ['uint256 overflow', { onchainReceivableId: (1n << 256n).toString() }],
+    ['invalid role', { subjectRole: 'FUNDER' as never }],
+    ['invalid version', { version: 2 as never }],
+    ['invalid salt', { authorizationSalt: '0x1234' }],
+    ['zero salt', { authorizationSalt: `0x${'0'.repeat(64)}` }],
+    ['numeric revenue', { annualRevenueKrw: 500000000 as never }],
+  ])('rejects %s before GIWA lookup', async (_label, overrides) => {
+    const response = await post('/authorization-challenges', { ...validRequest, ...overrides });
+    expect(response.status).toBe(400);
+    expect((await response.json()).error.code).toBe('INVALID_REQUEST');
+    expect(resolveReceivable).not.toHaveBeenCalled();
+  });
+
+  it('rejects an unapproved deployment before GIWA lookup', async () => {
+    const response = await post('/authorization-challenges', {
+      ...validRequest,
+      midnightContractAddress: 'bb'.repeat(32),
+    });
+    expect(response.status).toBe(400);
+    expect((await response.json()).error.code).toBe('UNAPPROVED_MIDNIGHT_CONTRACT');
+    expect(resolveReceivable).not.toHaveBeenCalled();
+  });
+
+  it('maps missing receivables and RPC failures to safe errors', async () => {
+    const missing = await post('/authorization-challenges', {
+      ...validRequest,
+      onchainReceivableId: '404',
+    });
+    expect(missing.status).toBe(404);
+    expect((await missing.json()).error.code).toBe('GIWA_RECEIVABLE_NOT_FOUND');
+
+    const unavailable = await post('/authorization-challenges', {
+      ...validRequest,
+      onchainReceivableId: '503',
+    });
+    expect(unavailable.status).toBe(502);
+    const serialized = JSON.stringify(await unavailable.json());
+    expect(serialized).toContain('GIWA_RPC_UNAVAILABLE');
+    expect(serialized).not.toContain('test RPC failure details');
+  });
+
+  it.each(['/authorization-challenges', '/attest'])('requires uncompressed JSON at %s', async (path) => {
+    const contentType = await post(path, validRequest, { 'Content-Type': 'text/plain' });
+    expect(contentType.status).toBe(415);
+    expect((await contentType.json()).error.code).toBe('JSON_BODY_REQUIRED');
+
+    const compressed = await fetch(`${baseUrl}${path}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Encoding': 'gzip',
+      },
+      body: JSON.stringify(validRequest),
+    });
+    expect(compressed.status).toBe(415);
+    expect((await compressed.json()).error.code).toBe('UNSUPPORTED_CONTENT_ENCODING');
+  });
+
+  it('rejects oversized bodies before GIWA lookup', async () => {
+    const response = await post('/authorization-challenges', {
+      ...validRequest,
+      padding: 'x'.repeat(MAX_ATTESTATION_BODY_BYTES),
+    });
+    expect(response.status).toBe(413);
+    expect(await response.json()).toEqual({
+      error: {
+        code: 'PAYLOAD_TOO_LARGE',
+        message: 'The request body is too large.',
+      },
+    });
+    expect(resolveReceivable).not.toHaveBeenCalled();
+  });
+
+  it('returns a safe structured error for malformed JSON without reflecting the body', async () => {
+    const response = await fetch(`${baseUrl}/authorization-challenges`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{"authorizationSalt":"must-not-be-reflected",',
+    });
+    expect(response.status).toBe(400);
+    const serialized = await response.text();
+    expect(JSON.parse(serialized)).toEqual({
+      error: {
+        code: 'INVALID_JSON',
+        message: 'The JSON request body is invalid.',
+      },
+    });
+    expect(serialized).not.toContain('must-not-be-reflected');
+    expect(resolveReceivable).not.toHaveBeenCalled();
+  });
+
+  it('rejects the legacy direct /attest request without an authorization', async () => {
+    const response = await post('/attest', validRequest);
+    expect(response.status).toBe(400);
+    expect((await response.json()).error.code).toBe('INVALID_REQUEST');
+    expect(resolveReceivable).not.toHaveBeenCalled();
   });
 });

@@ -64,14 +64,21 @@ describe('GASOK Financial Eligibility API', () => {
     const response = await api.verifyEligibility(
       contract,
       providers,
+      1n,
+      'SELLER',
       500_000_000n,
       20_000n,
       1n,
       secretPin,
       attestationApiUrl,
+      async () => {
+        throw new Error('The slow integration test requires an injected GIWA role-wallet signer.');
+      },
     );
-    expect(response.txId).toMatch(/[0-9a-f]{64}/);
-    expect(response.blockHeight).toBeGreaterThan(BigInt(0));
+    expect(response.finalizedTxData.txId).toMatch(/[0-9a-f]{64}/);
+    expect(response.finalizedTxData.blockHeight).toBeGreaterThan(BigInt(0));
+    expect(response.proofCapability.onchainReceivableId).toBe('1');
+    expect(response.proofCapability.subjectRole).toBe('SELLER');
 
     // Verify the public result state is queryable.
     const stateAfter = await api.displayContractState(providers, contract);

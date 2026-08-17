@@ -17,10 +17,18 @@ import * as path from 'node:path';
 import * as fs from 'node:fs/promises';
 import pinoPretty from 'pino-pretty';
 import pino from 'pino';
-import { createWriteStream } from 'node:fs';
 
 export const createLogger = async (logPath: string): Promise<pino.Logger> => {
   await fs.mkdir(path.dirname(logPath), { recursive: true });
+  const logFile = await fs.open(logPath, 'a', 0o600);
+  try {
+    // The create mode is used only for new files. chmod also tightens an
+    // existing log that may have been created with broader permissions.
+    await logFile.chmod(0o600);
+  } catch (error) {
+    await logFile.close();
+    throw error;
+  }
   const pretty: pinoPretty.PrettyStream = pinoPretty({
     colorize: true,
     sync: true,
@@ -36,7 +44,7 @@ export const createLogger = async (logPath: string): Promise<pino.Logger> => {
     },
     pino.multistream([
       { stream: pretty, level },
-      { stream: createWriteStream(logPath), level },
+      { stream: logFile.createWriteStream({ autoClose: true }), level },
     ]),
   );
 };

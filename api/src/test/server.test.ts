@@ -3,20 +3,30 @@ import type { Server } from 'node:http';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { contractNotFound } from '../errors.js';
 import { createApiServer } from '../server.js';
-import type { GetEligibilityResults } from '../eligibility.js';
+import type { GetEligibilityResult } from '../eligibility.js';
+import { DEFAULT_GASOK_CONTRACT_ADDRESS } from '../config.js';
+import { createValidCapability } from './fixture.js';
 
-const ADDRESS = 'ABCDEF0123456789'.repeat(4);
+const RESOLVE_PATH = '/v1/eligibility-results/resolve';
 const servers: Server[] = [];
 
-async function start(getEligibilityResults: GetEligibilityResults): Promise<string> {
+async function start(getEligibilityResult: GetEligibilityResult): Promise<string> {
   const server = createApiServer({
-    getEligibilityResults,
-    approvedContractAddress: ADDRESS.toLowerCase(),
+    getEligibilityResult,
+    approvedContractAddress: DEFAULT_GASOK_CONTRACT_ADDRESS,
   });
   servers.push(server);
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   const address = server.address() as AddressInfo;
   return `http://127.0.0.1:${address.port}`;
+}
+
+function postJson(baseUrl: string, body: unknown): Promise<Response> {
+  return fetch(`${baseUrl}${RESOLVE_PATH}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
 }
 
 afterEach(async () => {
@@ -27,13 +37,14 @@ afterEach(async () => {
   );
 });
 
-describe('read-only HTTP API', () => {
-  it('reports a local undeployed health response with no-store caching', async () => {
+describe('proof-capability HTTP API', () => {
+  it('reports local health with no-store caching and no CORS', async () => {
     const baseUrl = await start(vi.fn());
     const response = await fetch(`${baseUrl}/health`);
 
     expect(response.status).toBe(200);
     expect(response.headers.get('cache-control')).toBe('no-store');
+    expect(response.headers.get('access-control-allow-origin')).toBeNull();
     await expect(response.json()).resolves.toEqual({
       status: 'ok',
       service: 'gasok-midnight-read-api',
@@ -41,61 +52,146 @@ describe('read-only HTTP API', () => {
     });
   });
 
-  it('normalizes the contract address and returns the agreed response shape', async () => {
-    const getEligibilityResults = vi.fn<GetEligibilityResults>().mockImplementation(async (contractAddress) => ({
-      networkId: 'undeployed',
-      contractAddress,
-      results: [{ commitment: '01', eligible: true, providerId: '1', policyVersion: '1' }],
-    }));
-    const baseUrl = await start(getEligibilityResults);
-    const response = await fetch(`${baseUrl}/v1/contracts/${ADDRESS}/eligibility-results`);
+  it('resolves one exact result and returns only normalized allowlisted context', async () => {
+    const capability = createValidCapability();
+    const getEligibilityResult = vi.fn<GetEligibilityResult>().mockResolvedValue({
+      eligible: true,
+      providerId: '1',
+      policyVersion: '1',
+    });
+    const baseUrl = await start(getEligibilityResult);
+    const response = await postJson(baseUrl, capability);
 
     expect(response.status).toBe(200);
     expect(response.headers.get('cache-control')).toBe('no-store');
-    expect(getEligibilityResults).toHaveBeenCalledWith(ADDRESS.toLowerCase());
-    await expect(response.json()).resolves.toEqual({
+    expect(response.headers.get('access-control-allow-origin')).toBeNull();
+    expect(getEligibilityResult).toHaveBeenCalledOnce();
+    const [contractAddress, lookupKey] = getEligibilityResult.mock.calls[0];
+    expect(contractAddress).toBe(capability.midnightContractAddress);
+    expect(Buffer.from(lookupKey).toString('hex')).toBe(capability.lookupKey.slice(2));
+
+    const body = await response.json() as Record<string, unknown>;
+    expect(body).toEqual({
       networkId: 'undeployed',
-      contractAddress: ADDRESS.toLowerCase(),
-      results: [{ commitment: '01', eligible: true, providerId: '1', policyVersion: '1' }],
-    });
-  });
-
-  it('rejects malformed addresses before querying the Indexer', async () => {
-    const getEligibilityResults = vi.fn<GetEligibilityResults>();
-    const baseUrl = await start(getEligibilityResults);
-    const response = await fetch(`${baseUrl}/v1/contracts/not-hex/eligibility-results`);
-
-    expect(response.status).toBe(400);
-    expect(getEligibilityResults).not.toHaveBeenCalled();
-    await expect(response.json()).resolves.toEqual({
-      error: {
-        code: 'INVALID_CONTRACT_ADDRESS',
-        message: 'Contract address must be exactly 64 hexadecimal characters.',
+      contractAddress: capability.midnightContractAddress,
+      context: {
+        giwaChainId: capability.giwaChainId,
+        receivableFinanceAddress: capability.receivableFinanceAddress,
+        onchainReceivableId: capability.onchainReceivableId,
+        subjectRole: capability.subjectRole,
+        partyWallet: capability.partyWallet,
+      },
+      result: {
+        lookupKey: capability.lookupKey,
+        eligible: true,
+        providerId: '1',
+        policyVersion: '1',
       },
     });
+    expect(body.companyCommitment).toBeUndefined();
+    expect(JSON.stringify(body)).not.toContain('annualRevenueKrw');
+    expect(JSON.stringify(body)).not.toContain('signature');
+    expect(JSON.stringify(body)).not.toContain('secret');
   });
 
-  it('rejects a well-formed address that is not the configured GASOK contract', async () => {
-    const getEligibilityResults = vi.fn<GetEligibilityResults>();
-    const baseUrl = await start(getEligibilityResults);
+  it('disables the old public enumeration route', async () => {
+    const getEligibilityResult = vi.fn<GetEligibilityResult>();
+    const baseUrl = await start(getEligibilityResult);
     const response = await fetch(
-      `${baseUrl}/v1/contracts/${'0'.repeat(64)}/eligibility-results`,
+      `${baseUrl}/v1/contracts/${DEFAULT_GASOK_CONTRACT_ADDRESS}/eligibility-results`,
     );
 
     expect(response.status).toBe(404);
-    expect(getEligibilityResults).not.toHaveBeenCalled();
-    await expect(response.json()).resolves.toEqual({
-      error: {
-        code: 'UNAPPROVED_CONTRACT_ADDRESS',
-        message: 'This is not the configured GASOK Midnight contract.',
-      },
+    expect(getEligibilityResult).not.toHaveBeenCalled();
+  });
+
+  it('requires POST for capability resolution', async () => {
+    const baseUrl = await start(vi.fn());
+    const response = await fetch(`${baseUrl}${RESOLVE_PATH}`);
+
+    expect(response.status).toBe(405);
+    expect(response.headers.get('allow')).toBe('POST');
+  });
+
+  it('requires an application/json body', async () => {
+    const getEligibilityResult = vi.fn<GetEligibilityResult>();
+    const baseUrl = await start(getEligibilityResult);
+    const response = await fetch(`${baseUrl}${RESOLVE_PATH}`, {
+      method: 'POST',
+      body: JSON.stringify(createValidCapability()),
+    });
+
+    expect(response.status).toBe(415);
+    expect(getEligibilityResult).not.toHaveBeenCalled();
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: 'JSON_BODY_REQUIRED' },
     });
   });
 
-  it('returns safe public errors without implementation details', async () => {
-    const getEligibilityResults = vi.fn<GetEligibilityResults>().mockRejectedValue(contractNotFound());
-    const baseUrl = await start(getEligibilityResults);
-    const response = await fetch(`${baseUrl}/v1/contracts/${ADDRESS}/eligibility-results`);
+  it('rejects malformed JSON safely', async () => {
+    const getEligibilityResult = vi.fn<GetEligibilityResult>();
+    const baseUrl = await start(getEligibilityResult);
+    const response = await fetch(`${baseUrl}${RESOLVE_PATH}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{',
+    });
+
+    expect(response.status).toBe(400);
+    expect(getEligibilityResult).not.toHaveBeenCalled();
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: 'INVALID_JSON_BODY' },
+    });
+  });
+
+  it('rejects oversized capability bodies before querying the Indexer', async () => {
+    const getEligibilityResult = vi.fn<GetEligibilityResult>();
+    const baseUrl = await start(getEligibilityResult);
+    const response = await postJson(baseUrl, {
+      ...createValidCapability(),
+      padding: 'x'.repeat(5_000),
+    });
+
+    expect(response.status).toBe(413);
+    expect(getEligibilityResult).not.toHaveBeenCalled();
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: 'REQUEST_BODY_TOO_LARGE' },
+    });
+  });
+
+  it('rejects extra financial fields under the strict v1 schema', async () => {
+    const getEligibilityResult = vi.fn<GetEligibilityResult>();
+    const baseUrl = await start(getEligibilityResult);
+    const response = await postJson(baseUrl, {
+      ...createValidCapability(),
+      annualRevenueKrw: '500000000',
+    });
+
+    expect(response.status).toBe(400);
+    expect(getEligibilityResult).not.toHaveBeenCalled();
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: 'INVALID_PROOF_CAPABILITY' },
+    });
+  });
+
+  it('rejects a mismatched lookup key before querying the Indexer', async () => {
+    const getEligibilityResult = vi.fn<GetEligibilityResult>();
+    const baseUrl = await start(getEligibilityResult);
+    const response = await postJson(baseUrl, createValidCapability({
+      lookupKey: `0x${'ff'.repeat(32)}`,
+    }));
+
+    expect(response.status).toBe(400);
+    expect(getEligibilityResult).not.toHaveBeenCalled();
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: 'CAPABILITY_LOOKUP_MISMATCH' },
+    });
+  });
+
+  it('returns safe reader errors without implementation details', async () => {
+    const getEligibilityResult = vi.fn<GetEligibilityResult>().mockRejectedValue(contractNotFound());
+    const baseUrl = await start(getEligibilityResult);
+    const response = await postJson(baseUrl, createValidCapability());
 
     expect(response.status).toBe(404);
     await expect(response.json()).resolves.toEqual({
@@ -104,13 +200,5 @@ describe('read-only HTTP API', () => {
         message: 'No public contract state was found for this address.',
       },
     });
-  });
-
-  it('allows GET only', async () => {
-    const baseUrl = await start(vi.fn());
-    const response = await fetch(`${baseUrl}/health`, { method: 'POST' });
-
-    expect(response.status).toBe(405);
-    expect(response.headers.get('allow')).toBe('GET');
   });
 });

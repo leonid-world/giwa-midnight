@@ -60,11 +60,11 @@ module schnorr {
                         ann_y: Field,
                         pk_x: Field,
                         pk_y: Field,
-                        msg: Vector<4, Field>
+                        msg: Vector<8, Field>
                         ): Field {
     const cFull: Field =
-            transientHash<SchnorrHashInput<4>>(
-              SchnorrHashInput<4> { ann_x: ann_x, ann_y: ann_y, pk_x: pk_x, pk_y: pk_y, msg: msg }
+            transientHash<SchnorrHashInput<8>>(
+              SchnorrHashInput<8> { ann_x: ann_x, ann_y: ann_y, pk_x: pk_x, pk_y: pk_y, msg: msg }
               );
     // Return the full hash. Callers must truncate to 248 bits (mod 2^248)
     // to match schnorrVerify's challenge reduction.

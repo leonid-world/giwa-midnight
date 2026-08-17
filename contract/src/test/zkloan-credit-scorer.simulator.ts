@@ -6,15 +6,27 @@ import {
   type CircuitContext,
   createConstructorContext,
   createCircuitContext,
+  encodeContractAddress,
   sampleContractAddress,
+  type ContractAddress,
   type JubjubPoint,
   transientHash,
   CompactTypeBytes,
 } from '@midnight-ntwrk/midnight-js-protocol/compact-runtime';
-import { Contract, type Ledger, ledger, pureCircuits } from '../managed/zkloan-credit-scorer/contract/index.js';
+import {
+  Contract,
+  type GiwaReceivableSubject,
+  type Ledger,
+  ledger,
+  pureCircuits,
+} from '../managed/zkloan-credit-scorer/contract/index.js';
 import { type GasokEligibilityPrivateState, witnesses } from '../witnesses.js';
 import { createEitherTestUser } from './utils/address.js';
 import {
+  type FinancialAttestationBinding,
+  GIWA_CHAIN_ID,
+  RECEIVABLE_FINANCE_ADDRESS,
+  createGiwaReceivableSubject,
   createSignedFinancialProfileFromFixture,
   generateCompanySecret,
   generateProviderKeyPair,
@@ -29,10 +41,18 @@ export class GasokEligibilitySimulator {
   readonly providerPk: JubjubPoint;
   readonly providerId: bigint = 1n;
   readonly companySecretKey: Uint8Array;
+  readonly giwaChainId: bigint = GIWA_CHAIN_ID;
+  readonly receivableFinanceAddress: Uint8Array = Uint8Array.from(RECEIVABLE_FINANCE_ADDRESS);
+  readonly midnightContractAddress: ContractAddress;
+  readonly midnightContractAddressBytes: Uint8Array;
+  readonly defaultSubject: GiwaReceivableSubject;
 
   constructor() {
     const deployer = createEitherTestUser('GASOK deployer');
     this.contract = new Contract<GasokEligibilityPrivateState>(witnesses);
+    this.midnightContractAddress = sampleContractAddress();
+    this.midnightContractAddressBytes = encodeContractAddress(this.midnightContractAddress);
+    this.defaultSubject = createGiwaReceivableSubject();
 
     const providerKeyPair = generateProviderKeyPair();
     this.providerSk = providerKeyPair.sk;
@@ -41,20 +61,20 @@ export class GasokEligibilitySimulator {
     // The deployer's secret establishes the initial admin and the default
     // pseudonymous company commitment. It remains only in private state.
     this.companySecretKey = generateCompanySecret();
-    const commitmentHash = this.computeCompanyCommitmentHash(this.companySecretKey, 1234n);
     const initialPrivateState = createSignedFinancialProfileFromFixture(
       0,
       this.providerSk,
-      commitmentHash,
-      this.providerId,
+      this.createAttestationBinding(this.companySecretKey, 1234n, this.defaultSubject),
       this.companySecretKey,
     );
 
     const { currentPrivateState, currentContractState, currentZswapLocalState } = this.contract.initialState(
       createConstructorContext(initialPrivateState, deployer.left.hex),
+      this.giwaChainId,
+      this.receivableFinanceAddress,
     );
     this.circuitContext = createCircuitContext(
-      sampleContractAddress(),
+      this.midnightContractAddress,
       currentZswapLocalState,
       currentContractState,
       currentPrivateState,
@@ -73,6 +93,81 @@ export class GasokEligibilitySimulator {
 
   public computeCompanyCommitmentHash(companySecret: Uint8Array, pin: bigint): bigint {
     return transientHash(bytes32Type, this.deriveCompanyCommitment(companySecret, pin));
+  }
+
+  public deriveGiwaReceivableBindingHash(
+    subject: GiwaReceivableSubject,
+    giwaChainId: bigint = this.giwaChainId,
+    receivableFinanceAddress: Uint8Array = this.receivableFinanceAddress,
+  ): Uint8Array {
+    return pureCircuits.deriveGiwaReceivableBindingHash(giwaChainId, receivableFinanceAddress, subject);
+  }
+
+  public computeGiwaReceivableBindingHash(
+    subject: GiwaReceivableSubject,
+    giwaChainId: bigint = this.giwaChainId,
+    receivableFinanceAddress: Uint8Array = this.receivableFinanceAddress,
+  ): bigint {
+    return transientHash(
+      bytes32Type,
+      this.deriveGiwaReceivableBindingHash(subject, giwaChainId, receivableFinanceAddress),
+    );
+  }
+
+  public deriveMidnightDeploymentHash(
+    midnightContractAddressBytes: Uint8Array = this.midnightContractAddressBytes,
+  ): Uint8Array {
+    return pureCircuits.deriveMidnightDeploymentHash(midnightContractAddressBytes);
+  }
+
+  public computeMidnightDeploymentHash(
+    midnightContractAddressBytes: Uint8Array = this.midnightContractAddressBytes,
+  ): bigint {
+    return transientHash(bytes32Type, this.deriveMidnightDeploymentHash(midnightContractAddressBytes));
+  }
+
+  public deriveReceivableEligibilityKey(
+    companySecret: Uint8Array,
+    pin: bigint,
+    subject: GiwaReceivableSubject = this.defaultSubject,
+    options: {
+      giwaChainId?: bigint;
+      receivableFinanceAddress?: Uint8Array;
+      midnightContractAddressBytes?: Uint8Array;
+    } = {},
+  ): Uint8Array {
+    const companyCommitment = this.deriveCompanyCommitment(companySecret, pin);
+    const bindingHash = this.deriveGiwaReceivableBindingHash(
+      subject,
+      options.giwaChainId,
+      options.receivableFinanceAddress,
+    );
+    const deploymentHash = this.deriveMidnightDeploymentHash(options.midnightContractAddressBytes);
+
+    return pureCircuits.deriveReceivableEligibilityKey(companyCommitment, bindingHash, deploymentHash);
+  }
+
+  public createAttestationBinding(
+    companySecret: Uint8Array,
+    pin: bigint,
+    subject: GiwaReceivableSubject = this.defaultSubject,
+    options: {
+      giwaChainId?: bigint;
+      receivableFinanceAddress?: Uint8Array;
+      midnightContractAddressBytes?: Uint8Array;
+      providerId?: bigint;
+    } = {},
+  ): FinancialAttestationBinding {
+    return {
+      companyCommitmentHash: this.computeCompanyCommitmentHash(companySecret, pin),
+      giwaReceivableBindingHash: this.computeGiwaReceivableBindingHash(
+        subject,
+        options.giwaChainId,
+        options.receivableFinanceAddress,
+      ),
+      midnightDeploymentHash: this.computeMidnightDeploymentHash(options.midnightContractAddressBytes),
+      providerId: options.providerId ?? this.providerId,
+    };
   }
 
   public generateCompanySecret(): Uint8Array {
@@ -104,8 +199,12 @@ export class GasokEligibilitySimulator {
     };
   }
 
-  public verifyEligibility(secretPin: bigint): Ledger {
-    this.circuitContext = this.contract.impureCircuits.verifyEligibility(this.circuitContext, secretPin).context;
+  public verifyEligibility(secretPin: bigint, subject: GiwaReceivableSubject = this.defaultSubject): Ledger {
+    this.circuitContext = this.contract.impureCircuits.verifyEligibility(
+      this.circuitContext,
+      secretPin,
+      subject,
+    ).context;
     return ledger(this.circuitContext.currentQueryContext.state);
   }
 

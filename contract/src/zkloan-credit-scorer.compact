@@ -14,6 +14,15 @@ export struct EligibilityResult {
     policyVersion: Uint<16>;
 }
 
+// This public GIWA context is folded into an opaque Midnight lookup key. The
+// fields themselves are circuit inputs and are not copied into public ledger
+// state. SELLER is encoded as 1 and BUYER as 2.
+export struct GiwaReceivableSubject {
+    receivableId: Bytes<32>;
+    subjectRole: Uint<8>;
+    partyWallet: Bytes<20>;
+}
+
 struct FinancialProfile {
     annualRevenueKrw: Uint<64>;
     debtRatioBps: Uint<32>;
@@ -25,18 +34,30 @@ struct FinancialProfile {
 // business registration number or a claim about a real-world company.
 export new type CompanySecretKey = Bytes<32>;
 export new type CompanyCommitment = Bytes<32>;
+export new type GiwaReceivableBindingHash = Bytes<32>;
+export new type ReceivableEligibilityKey = Bytes<32>;
+export new type MidnightDeploymentHash = Bytes<32>;
 export new type AdminPublicKey = Bytes<32>;
 
-constructor() {
+constructor(configuredGiwaChainId: Uint<64>, configuredReceivableFinanceAddress: Bytes<20>) {
+    assert(configuredGiwaChainId > 0, "GIWA chain ID must be positive");
+    assert(
+        configuredReceivableFinanceAddress != Bytes[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        "ReceivableFinance address must not be zero"
+    );
     contractAdmin = disclose(deriveAdminPublicKey(getCompanySecret()));
+    giwaChainId = disclose(configuredGiwaChainId);
+    receivableFinanceAddress = disclose(configuredReceivableFinanceAddress);
 }
 
 // Only the commitment and the verified outcome are public. Raw financial
 // values, the provider signature, and the company secret are witness data and
 // are never inserted into ledger state.
-export ledger eligibilityResults: Map<CompanyCommitment, EligibilityResult>;
+export ledger eligibilityResults: Map<ReceivableEligibilityKey, EligibilityResult>;
 export ledger contractAdmin: AdminPublicKey;
 export ledger providers: Map<Uint<16>, JubjubPoint>;
+export sealed ledger giwaChainId: Uint<64>;
+export sealed ledger receivableFinanceAddress: Bytes<20>;
 
 witness getAttestedFinancialWitness(): [FinancialProfile, Schnorr_SchnorrSignature, Uint<16>];
 witness getCompanySecret(): CompanySecretKey;
@@ -60,46 +81,126 @@ export pure circuit deriveAdminPublicKey(sk: CompanySecretKey): AdminPublicKey {
     ]) as AdminPublicKey;
 }
 
+export pure circuit deriveGiwaReceivableBindingHash(
+    configuredGiwaChainId: Uint<64>,
+    configuredReceivableFinanceAddress: Bytes<20>,
+    subject: GiwaReceivableSubject
+): GiwaReceivableBindingHash {
+    assert(configuredGiwaChainId > 0, "GIWA chain ID must be positive");
+    assert(subject.subjectRole == 1 || subject.subjectRole == 2, "Subject role must be SELLER or BUYER");
+    assert(
+        subject.receivableId != Bytes[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        "GIWA receivable ID must be positive"
+    );
+    assert(
+        subject.partyWallet != Bytes[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        "GIWA party wallet must not be zero"
+    );
+
+    return persistentHash<[
+        Bytes<32>, Uint<64>, Bytes<20>, Bytes<32>, Uint<8>, Bytes<20>
+    ]>([
+        "gasok:giwa:receivable-binding:v1",
+        configuredGiwaChainId,
+        configuredReceivableFinanceAddress,
+        subject.receivableId,
+        subject.subjectRole,
+        subject.partyWallet
+    ]) as GiwaReceivableBindingHash;
+}
+
+export pure circuit deriveMidnightDeploymentHash(
+    contractAddress: Bytes<32>
+): MidnightDeploymentHash {
+    return persistentHash<[Bytes<28>, Bytes<32>]>([
+        "gasok:midnight:deployment:v1",
+        contractAddress
+    ]) as MidnightDeploymentHash;
+}
+
+export pure circuit deriveReceivableEligibilityKey(
+    companyCommitment: CompanyCommitment,
+    bindingHash: GiwaReceivableBindingHash,
+    deploymentHash: MidnightDeploymentHash
+): ReceivableEligibilityKey {
+    return persistentHash<[
+        Bytes<27>, CompanyCommitment, GiwaReceivableBindingHash, MidnightDeploymentHash, Uint<16>
+    ]>([
+        "gasok:eligibility:lookup:v1",
+        companyCommitment,
+        bindingHash,
+        deploymentHash,
+        1
+    ]) as ReceivableEligibilityKey;
+}
+
 // A successful call proves two separate facts:
 // 1. a currently registered mock provider signed these exact private values
-//    for this company commitment; and
+//    for this company commitment, GIWA receivable/role, and Midnight contract;
+//    and
 // 2. those values were evaluated by policy version 1.
 // An ineligible but correctly attested profile writes eligible=false. An
 // invalid signature or unregistered provider writes no result at all.
-export circuit verifyEligibility(secretPin: Uint<16>): [] {
+export circuit verifyEligibility(secretPin: Uint<16>, subject: GiwaReceivableSubject): [] {
     const companyCommitment = deriveCompanyCommitment(getCompanySecret(), secretPin);
-    const disclosedCompanyCommitment = disclose(companyCommitment);
     const companyCommitmentHash = transientHash<Bytes<32>>(
-        disclosedCompanyCommitment as Bytes<32>
+        companyCommitment as Bytes<32>
     );
+    const bindingHash = deriveGiwaReceivableBindingHash(
+        giwaChainId,
+        receivableFinanceAddress,
+        subject
+    );
+    const deploymentHash = deriveMidnightDeploymentHash(kernel.self().bytes);
+    const eligibilityKey = deriveReceivableEligibilityKey(
+        companyCommitment,
+        bindingHash,
+        deploymentHash
+    );
+    const disclosedEligibilityKey = disclose(eligibilityKey);
 
-    const [eligible, providerId] = evaluateFinancialProfile(companyCommitmentHash);
+    assert(!eligibilityResults.member(disclosedEligibilityKey), "Eligibility result already exists");
+
+    const [eligible, providerId] = evaluateFinancialProfile(
+        companyCommitmentHash,
+        transientHash<Bytes<32>>(bindingHash as Bytes<32>),
+        transientHash<Bytes<32>>(deploymentHash as Bytes<32>)
+    );
     const result = EligibilityResult {
         eligible: eligible,
         providerId: providerId,
         policyVersion: 1,
     };
 
-    eligibilityResults.insert(disclosedCompanyCommitment, disclose(result));
+    eligibilityResults.insert(disclosedEligibilityKey, disclose(result));
 }
 
-circuit evaluateFinancialProfile(companyCommitmentHash: Field): [Boolean, Uint<16>] {
+circuit evaluateFinancialProfile(
+    companyCommitmentHash: Field,
+    bindingHash: Field,
+    deploymentHash: Field
+): [Boolean, Uint<16>] {
     const [profile, signature, providerId] = getAttestedFinancialWitness();
     const disclosedProviderId = disclose(providerId);
 
     assert(providers.member(disclosedProviderId), "Attestation provider not registered");
     const providerPk = providers.lookup(disclosedProviderId);
+    assertValidProviderPublicKey(providerPk);
 
     // The field order is part of the signed-message protocol and must match
     // the Mock Attestation API exactly.
-    const msg: Vector<4, Field> = [
+    const msg: Vector<8, Field> = [
         profile.annualRevenueKrw as Field,
         profile.debtRatioBps as Field,
         profile.overdueCount as Field,
-        companyCommitmentHash
+        companyCommitmentHash,
+        bindingHash,
+        deploymentHash,
+        disclosedProviderId as Field,
+        1
     ];
 
-    Schnorr_schnorrVerify<4>(msg, signature, providerPk);
+    Schnorr_schnorrVerify<8>(msg, signature, providerPk);
 
     const eligible =
         profile.annualRevenueKrw >= 500000000 &&
@@ -109,8 +210,19 @@ circuit evaluateFinancialProfile(companyCommitmentHash: Field): [Boolean, Uint<1
     return [eligible, disclosedProviderId];
 }
 
+// The Jubjub identity point (0, 1) has no secret-key owner. If it were accepted
+// as a provider key, sG = R + cPk would reduce to sG = R and anyone could forge
+// a signature for any message by choosing R = sG.
+circuit assertValidProviderPublicKey(providerPk: JubjubPoint): [] {
+    assert(
+        jubjubPointX(providerPk) != 0 || jubjubPointY(providerPk) != 1,
+        "Provider public key must not be the Jubjub identity"
+    );
+}
+
 export circuit registerProvider(providerId: Uint<16>, providerPk: JubjubPoint): [] {
     assert(contractAdmin == deriveAdminPublicKey(getCompanySecret()), "Only admin can register providers");
+    assertValidProviderPublicKey(providerPk);
     providers.insert(disclose(providerId), disclose(providerPk));
 }
 
@@ -130,7 +242,7 @@ export circuit rotateAdmin(newAdmin: AdminPublicKey): [] {
 export pure circuit schnorrChallenge(
     ann_x: Field, ann_y: Field,
     pk_x: Field, pk_y: Field,
-    msg: Vector<4, Field>
+    msg: Vector<8, Field>
 ): Field {
     return Schnorr_schnorrChallenge(ann_x, ann_y, pk_x, pk_y, msg);
 }

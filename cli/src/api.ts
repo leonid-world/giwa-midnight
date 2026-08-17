@@ -18,6 +18,7 @@ import {
   type ContractAddress,
   transientHash,
   CompactTypeBytes,
+  MAX_FIELD,
 } from '@midnight-ntwrk/midnight-js-protocol/compact-runtime';
 import { GasokEligibility, type GasokEligibilityPrivateState, witnesses } from 'zkloan-credit-scorer-contract';
 import * as ledger from '@midnight-ntwrk/midnight-js-protocol/ledger';
@@ -68,6 +69,31 @@ import {
 } from './common-types';
 import { type Config, contractConfig } from './config';
 import { getInitialPrivateState } from './state.utils';
+import {
+  bytesToHex,
+  fixedHexToBytes,
+  getDefaultGiwaDeploymentConfig,
+  isZeroBytes,
+  normalizeEvmAddress,
+  normalizeMidnightContractAddress,
+  receivableIdToBytes,
+  subjectRoleToCode,
+  validateGiwaDeploymentConfig,
+  type GiwaDeploymentConfig,
+  type SubjectRole,
+} from './giwa';
+import {
+  AUTHORIZATION_PROVIDER_ID,
+  createAuthorizationChallengeRequest,
+  generateAuthorizationSalt,
+  parseAuthorizationChallenge,
+  validateAuthorizationProof,
+  type AuthorizationChallenge,
+  type AuthorizationChallengeRequest,
+  type AuthorizationExpectedContext,
+  type AuthorizationProof,
+  type RoleAuthorizationCallback,
+} from './authorization';
 
 let logger: Logger;
 // @ts-expect-error: It's needed to enable WebSocket usage through apollo
@@ -103,12 +129,28 @@ export const joinContract = async (
   providers: GasokEligibilityProviders,
   contractAddress: string,
 ): Promise<DeployedGasokEligibilityContract> => {
-  const contract = await findDeployedContract(providers as any, {
-    contractAddress,
-    compiledContract: gasokEligibilityCompiledContract,
-    privateStateId: 'gasokEligibilityPrivateState',
-    initialPrivateState: getInitialPrivateState(),
-  });
+  assertIsContractAddress(contractAddress);
+  providers.privateStateProvider.setContractAddress(contractAddress);
+  const existingPrivateState = await providers.privateStateProvider.get('gasokEligibilityPrivateState');
+  // Midnight.js treats initialPrivateState as an explicit overwrite during find.
+  // Omit it when this wallet already has contract-scoped state so its company
+  // secret (and any admin authority derived from it) survives CLI restarts.
+  if (existingPrivateState === null) {
+    logger.info('No private state exists for this wallet and contract; creating a new non-admin participant state.');
+  }
+  const contract =
+    existingPrivateState === null
+      ? await findDeployedContract(providers as any, {
+          contractAddress,
+          compiledContract: gasokEligibilityCompiledContract,
+          privateStateId: 'gasokEligibilityPrivateState',
+          initialPrivateState: getInitialPrivateState(),
+        })
+      : await findDeployedContract(providers as any, {
+          contractAddress,
+          compiledContract: gasokEligibilityCompiledContract,
+          privateStateId: 'gasokEligibilityPrivateState',
+        });
   logger.info(`Joined contract at address: ${contract.deployTxData.public.contractAddress}`);
 
   return contract as any;
@@ -117,15 +159,17 @@ export const joinContract = async (
 export const deploy = async (
   providers: GasokEligibilityProviders,
   privateState: GasokEligibilityPrivateState,
+  configuredGiwa: GiwaDeploymentConfig = getDefaultGiwaDeploymentConfig(),
 ): Promise<DeployedGasokEligibilityContract> => {
   logger.info('Deploying GASOK Financial Eligibility contract...');
+
+  const giwa = validateGiwaDeploymentConfig(configuredGiwa);
 
   const contract = await deployContract(providers as any, {
     compiledContract: gasokEligibilityCompiledContract,
     privateStateId: 'gasokEligibilityPrivateState',
     initialPrivateState: privateState,
-    // Note: as of midnight-js 4.1.x, `args` is conditionally typed and must be
-    // omitted entirely when the contract constructor takes no arguments.
+    args: [giwa.chainId, giwa.receivableFinanceAddress],
   });
   logger.info(`Deployed contract at address: ${contract.deployTxData.public.contractAddress}`);
 
@@ -136,6 +180,324 @@ export const deploy = async (
 
 const bytes32Type = new CompactTypeBytes(32);
 const { pureCircuits } = GasokEligibility;
+const POLICY_VERSION = 1;
+
+export interface AttestedReceivableBinding {
+  readonly giwaChainId: bigint;
+  readonly receivableFinanceAddress: string;
+  readonly onchainReceivableId: bigint;
+  readonly subjectRole: SubjectRole;
+  readonly partyWallet: string;
+}
+
+export interface ValidatedMockAttestation {
+  readonly signature: { announcement: { x: bigint; y: bigint }; response: bigint };
+  readonly providerId: bigint;
+  readonly policyVersion: 1;
+  readonly midnightContractAddress: string;
+  readonly binding: AttestedReceivableBinding;
+}
+
+export interface ProofCapability {
+  readonly version: 1;
+  readonly midnightContractAddress: string;
+  readonly companyCommitment: string;
+  readonly lookupKey: string;
+  readonly giwaChainId: string;
+  readonly receivableFinanceAddress: string;
+  readonly onchainReceivableId: string;
+  readonly subjectRole: SubjectRole;
+  readonly partyWallet: string;
+}
+
+export interface EligibilityVerification {
+  readonly finalizedTxData: FinalizedTxData;
+  readonly proofCapability: ProofCapability;
+}
+
+export type EligibilityProofStage = 'attesting' | 'proving_and_submitting';
+
+export interface PreparedEligibilityVerification {
+  readonly authorizationChallenge: AuthorizationChallenge;
+  readonly authorizationRequest: AuthorizationChallengeRequest;
+  readonly companyCommitment: Uint8Array;
+  readonly expectedContext: AuthorizationExpectedContext;
+  readonly inputs: {
+    readonly annualRevenueKrw: bigint;
+    readonly debtRatioBps: bigint;
+    readonly overdueCount: bigint;
+    readonly secretPin: bigint;
+  };
+}
+
+export interface CompleteEligibilityVerificationOptions {
+  readonly onStage?: (stage: EligibilityProofStage) => void;
+}
+
+interface ExpectedAttestationContext extends AuthorizationExpectedContext {
+  readonly partyWallet?: string;
+}
+
+type JsonRecord = Record<string, unknown>;
+
+const ATTESTATION_RESPONSE_KEYS = [
+  'signature',
+  'providerId',
+  'policyVersion',
+  'midnightContractAddress',
+  'binding',
+  'attestationType',
+  'authorizationProtocol',
+] as const;
+const ATTESTATION_SIGNATURE_KEYS = ['announcement', 'response'] as const;
+const ATTESTATION_ANNOUNCEMENT_KEYS = ['x', 'y'] as const;
+const ATTESTATION_BINDING_KEYS = [
+  'giwaChainId',
+  'receivableFinanceAddress',
+  'onchainReceivableId',
+  'subjectRole',
+  'partyWallet',
+] as const;
+
+export const ATTESTATION_REQUEST_TIMEOUT_MS = 10_000;
+export const MAX_ATTESTATION_RESPONSE_BYTES = 64 * 1024;
+
+const INVALID_ATTESTATION_API_URL =
+  'Mock Attestation API URL must be an HTTP loopback base URL without credentials, query, fragment, or path.';
+
+class AttestationResponseTooLargeError extends Error {}
+
+class AttestationResponseAbortedError extends Error {}
+
+type LocalAttestationPath = '/attest' | '/authorization-challenges';
+
+export function resolveLocalAttestationEndpoint(
+  attestationApiUrl: string,
+  path: LocalAttestationPath = '/attest',
+): URL {
+  if (
+    typeof attestationApiUrl !== 'string' ||
+    attestationApiUrl.length === 0 ||
+    attestationApiUrl.length > 2_048 ||
+    attestationApiUrl !== attestationApiUrl.trim()
+  ) {
+    throw new Error(INVALID_ATTESTATION_API_URL);
+  }
+
+  let baseUrl: URL;
+  try {
+    baseUrl = new URL(attestationApiUrl);
+  } catch {
+    throw new Error(INVALID_ATTESTATION_API_URL);
+  }
+
+  const isLoopbackHost =
+    baseUrl.hostname === 'localhost' ||
+    baseUrl.hostname === '127.0.0.1' ||
+    baseUrl.hostname === '[::1]' ||
+    baseUrl.hostname === '::1';
+  if (
+    baseUrl.protocol !== 'http:' ||
+    !isLoopbackHost ||
+    baseUrl.username !== '' ||
+    baseUrl.password !== '' ||
+    baseUrl.search !== '' ||
+    baseUrl.hash !== '' ||
+    baseUrl.pathname !== '/' ||
+    baseUrl.port === '0'
+  ) {
+    throw new Error(INVALID_ATTESTATION_API_URL);
+  }
+
+  return new URL(path, baseUrl);
+}
+
+async function readLimitedAttestationResponse(response: Response, signal: AbortSignal): Promise<string> {
+  if (signal.aborted) {
+    throw new AttestationResponseAbortedError();
+  }
+  const declaredLength = response.headers.get('content-length');
+  if (
+    declaredLength !== null &&
+    /^[0-9]+$/.test(declaredLength) &&
+    BigInt(declaredLength) > BigInt(MAX_ATTESTATION_RESPONSE_BYTES)
+  ) {
+    void response.body?.cancel().catch(() => undefined);
+    throw new AttestationResponseTooLargeError();
+  }
+  if (response.body === null) {
+    return '';
+  }
+
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let byteLength = 0;
+  let rejectForAbort: (() => void) | undefined;
+  const aborted = new Promise<never>((_resolve, reject) => {
+    rejectForAbort = () => reject(new AttestationResponseAbortedError());
+    signal.addEventListener('abort', rejectForAbort, { once: true });
+  });
+
+  try {
+    while (true) {
+      if (signal.aborted) {
+        throw new AttestationResponseAbortedError();
+      }
+      const { done, value } = await Promise.race([reader.read(), aborted]);
+      if (done) {
+        break;
+      }
+      if (value === undefined || byteLength + value.byteLength > MAX_ATTESTATION_RESPONSE_BYTES) {
+        void reader.cancel().catch(() => undefined);
+        throw new AttestationResponseTooLargeError();
+      }
+      byteLength += value.byteLength;
+      chunks.push(value);
+    }
+  } finally {
+    if (rejectForAbort !== undefined) {
+      signal.removeEventListener('abort', rejectForAbort);
+    }
+    if (signal.aborted) {
+      void reader.cancel().catch(() => undefined);
+    }
+  }
+
+  return Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)), byteLength).toString('utf8');
+}
+
+function requireRecord(value: unknown, label: string): JsonRecord {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`Mock Attestation API returned an invalid ${label}.`);
+  }
+  return value as JsonRecord;
+}
+
+function requireExactRecord(
+  value: unknown,
+  label: string,
+  expectedKeys: ReadonlyArray<string>,
+): JsonRecord {
+  const record = requireRecord(value, label);
+  const actual = Object.keys(record).sort();
+  const expected = [...expectedKeys].sort();
+  if (actual.length !== expected.length || !actual.every((key, index) => key === expected[index])) {
+    throw new Error(`Mock Attestation API returned an invalid ${label}.`);
+  }
+  return record;
+}
+
+function parseCanonicalDecimal(value: unknown, label: string, maximum: bigint): bigint {
+  if (typeof value !== 'string' || !/^(0|[1-9][0-9]*)$/.test(value)) {
+    throw new Error(`Mock Attestation API returned a non-canonical ${label}.`);
+  }
+  const parsed = BigInt(value);
+  if (parsed > maximum) {
+    throw new Error(`Mock Attestation API returned an out-of-range ${label}.`);
+  }
+  return parsed;
+}
+
+function parseCanonicalEvmAddress(value: unknown, label: string): string {
+  if (typeof value !== 'string') {
+    throw new Error(`Mock Attestation API returned an invalid ${label}.`);
+  }
+  const normalized = normalizeEvmAddress(value, label);
+  if (value !== normalized || isZeroBytes(fixedHexToBytes(value, 20, label, { requirePrefix: true }))) {
+    throw new Error(`Mock Attestation API returned a non-canonical ${label}.`);
+  }
+  return normalized;
+}
+
+export function parseAttestationResponse(
+  value: unknown,
+  expected: ExpectedAttestationContext,
+): ValidatedMockAttestation {
+  const data = requireExactRecord(value, 'response', ATTESTATION_RESPONSE_KEYS);
+  if (data.attestationType !== 'mock') {
+    throw new Error('Attestation response is not marked as mock data.');
+  }
+  if (data.authorizationProtocol !== 'eip712-role-wallet-v1') {
+    throw new Error('Mock Attestation API returned an unsupported wallet authorization protocol.');
+  }
+  if (data.providerId !== AUTHORIZATION_PROVIDER_ID) {
+    throw new Error('Mock Attestation API returned an unsupported providerId.');
+  }
+  if (data.policyVersion !== POLICY_VERSION) {
+    throw new Error('Mock Attestation API returned an unsupported policyVersion.');
+  }
+
+  if (typeof data.midnightContractAddress !== 'string') {
+    throw new Error('Mock Attestation API returned an invalid Midnight contract address.');
+  }
+  const midnightContractAddress = normalizeMidnightContractAddress(data.midnightContractAddress);
+  if (
+    data.midnightContractAddress !== midnightContractAddress ||
+    midnightContractAddress !== expected.midnightContractAddress
+  ) {
+    throw new Error('Mock attestation is bound to a different Midnight contract.');
+  }
+
+  const signature = requireExactRecord(data.signature, 'signature', ATTESTATION_SIGNATURE_KEYS);
+  const announcement = requireExactRecord(
+    signature.announcement,
+    'signature announcement',
+    ATTESTATION_ANNOUNCEMENT_KEYS,
+  );
+  const parsedSignature = {
+    announcement: {
+      x: parseCanonicalDecimal(announcement.x, 'signature announcement.x', MAX_FIELD),
+      y: parseCanonicalDecimal(announcement.y, 'signature announcement.y', MAX_FIELD),
+    },
+    response: parseCanonicalDecimal(signature.response, 'signature response', MAX_FIELD),
+  };
+
+  const binding = requireExactRecord(data.binding, 'GIWA receivable binding', ATTESTATION_BINDING_KEYS);
+  const giwaChainId = parseCanonicalDecimal(binding.giwaChainId, 'binding.giwaChainId', (1n << 64n) - 1n);
+  if (giwaChainId !== expected.giwa.chainId) {
+    throw new Error('Mock attestation is bound to a different GIWA chain.');
+  }
+
+  const receivableFinanceAddress = parseCanonicalEvmAddress(
+    binding.receivableFinanceAddress,
+    'binding.receivableFinanceAddress',
+  );
+  const expectedReceivableFinanceAddress = bytesToHex(expected.giwa.receivableFinanceAddress);
+  if (receivableFinanceAddress !== expectedReceivableFinanceAddress) {
+    throw new Error('Mock attestation is bound to a different ReceivableFinance contract.');
+  }
+
+  const onchainReceivableId = parseCanonicalDecimal(
+    binding.onchainReceivableId,
+    'binding.onchainReceivableId',
+    (1n << 256n) - 1n,
+  );
+  if (onchainReceivableId === 0n || onchainReceivableId !== expected.onchainReceivableId) {
+    throw new Error('Mock attestation is bound to a different GIWA receivable.');
+  }
+  if (binding.subjectRole !== expected.subjectRole) {
+    throw new Error('Mock attestation is bound to a different receivable party role.');
+  }
+
+  const partyWallet = parseCanonicalEvmAddress(binding.partyWallet, 'binding.partyWallet');
+  if (expected.partyWallet !== undefined && partyWallet !== expected.partyWallet) {
+    throw new Error('Mock attestation is bound to a different authorized GIWA party wallet.');
+  }
+
+  return {
+    signature: parsedSignature,
+    providerId: BigInt(data.providerId as number),
+    policyVersion: 1,
+    midnightContractAddress,
+    binding: {
+      giwaChainId,
+      receivableFinanceAddress,
+      onchainReceivableId,
+      subjectRole: expected.subjectRole,
+      partyWallet,
+    },
+  };
+}
 
 export const deriveCompanyCommitment = (companySecretKey: Uint8Array, pin: bigint): Uint8Array => {
   return pureCircuits.deriveCompanyCommitment(companySecretKey, pin);
@@ -145,80 +507,397 @@ export const computeCompanyCommitmentHash = (companySecretKey: Uint8Array, pin: 
   return transientHash(bytes32Type, deriveCompanyCommitment(companySecretKey, pin));
 };
 
+export const deriveGiwaReceivableBindingHash = (
+  configuredGiwa: GiwaDeploymentConfig,
+  subject: GasokEligibility.GiwaReceivableSubject,
+): Uint8Array => {
+  const giwa = validateGiwaDeploymentConfig(configuredGiwa);
+  return pureCircuits.deriveGiwaReceivableBindingHash(giwa.chainId, giwa.receivableFinanceAddress, subject);
+};
+
+export const deriveMidnightDeploymentHash = (midnightContractAddress: string): Uint8Array => {
+  return pureCircuits.deriveMidnightDeploymentHash(
+    fixedHexToBytes(normalizeMidnightContractAddress(midnightContractAddress), 32, 'Midnight contract address'),
+  );
+};
+
+export const deriveReceivableEligibilityKey = (
+  companyCommitment: Uint8Array,
+  bindingHash: Uint8Array,
+  deploymentHash: Uint8Array,
+): Uint8Array => {
+  return pureCircuits.deriveReceivableEligibilityKey(companyCommitment, bindingHash, deploymentHash);
+};
+
+async function postLocalAttestationJson(
+  attestationApiUrl: string,
+  path: LocalAttestationPath,
+  body: unknown,
+): Promise<unknown> {
+  const endpoint = resolveLocalAttestationEndpoint(attestationApiUrl, path);
+  const signal = AbortSignal.timeout(ATTESTATION_REQUEST_TIMEOUT_MS);
+  let response: Response;
+  try {
+    response = await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      redirect: 'error',
+      signal,
+      body: JSON.stringify(body),
+    });
+  } catch {
+    if (signal.aborted) {
+      throw new Error('Mock Attestation API request timed out.');
+    }
+    throw new Error('Could not contact the local Mock Attestation API.');
+  }
+
+  let responseText: string;
+  try {
+    responseText = await readLimitedAttestationResponse(response, signal);
+  } catch (error) {
+    if (signal.aborted || error instanceof AttestationResponseAbortedError) {
+      throw new Error('Mock Attestation API request timed out.');
+    }
+    if (error instanceof AttestationResponseTooLargeError) {
+      throw new Error(`Mock Attestation API response exceeds ${MAX_ATTESTATION_RESPONSE_BYTES} bytes.`);
+    }
+    throw new Error('Could not read the local Mock Attestation API response.');
+  }
+
+  if (signal.aborted) {
+    throw new Error('Mock Attestation API request timed out.');
+  }
+
+  if (!response.ok) {
+    throw new Error(`Mock Attestation API returned HTTP ${response.status}.`);
+  }
+
+  let parsedResponse: unknown;
+  try {
+    parsedResponse = JSON.parse(responseText) as unknown;
+  } catch {
+    throw new Error('Mock Attestation API returned invalid JSON.');
+  }
+  return parsedResponse;
+}
+
+export const fetchAuthorizationChallenge = async (
+  attestationApiUrl: string,
+  request: AuthorizationChallengeRequest,
+  expected: AuthorizationExpectedContext,
+): Promise<AuthorizationChallenge> => {
+  const response = await postLocalAttestationJson(
+    attestationApiUrl,
+    '/authorization-challenges',
+    request,
+  );
+  return parseAuthorizationChallenge(response, request, expected);
+};
+
 export const fetchAttestation = async (
   attestationApiUrl: string,
+  request: AuthorizationChallengeRequest,
+  authorization: AuthorizationProof,
+  expected: ExpectedAttestationContext,
+): Promise<ValidatedMockAttestation> => {
+  const response = await postLocalAttestationJson(attestationApiUrl, '/attest', {
+    ...request,
+    authorization,
+  });
+  return parseAttestationResponse(response, expected);
+};
+
+const emptyAttestationSignature = () => ({
+  announcement: { x: 0n, y: 0n },
+  response: 0n,
+});
+
+export const sanitizeEligibilityPrivateState = (
+  privateState: GasokEligibilityPrivateState,
+): GasokEligibilityPrivateState => ({
+  ...privateState,
+  annualRevenueKrw: 0n,
+  debtRatioBps: 0n,
+  overdueCount: 0n,
+  attestationSignature: emptyAttestationSignature(),
+  attestationProviderId: 0n,
+});
+
+const hasTransientEligibilityData = (privateState: GasokEligibilityPrivateState): boolean =>
+  privateState.annualRevenueKrw !== 0n ||
+  privateState.debtRatioBps !== 0n ||
+  privateState.overdueCount !== 0n ||
+  privateState.attestationSignature.announcement.x !== 0n ||
+  privateState.attestationSignature.announcement.y !== 0n ||
+  privateState.attestationSignature.response !== 0n ||
+  privateState.attestationProviderId !== 0n;
+
+export const prepareEligibilityVerificationWithGiwaConfig = async (
+  contract: DeployedGasokEligibilityContract,
+  providers: GasokEligibilityProviders,
+  configuredGiwa: GiwaDeploymentConfig,
+  onchainReceivableId: bigint,
+  subjectRole: SubjectRole,
   annualRevenueKrw: bigint,
   debtRatioBps: bigint,
   overdueCount: bigint,
-  companyCommitmentHash: bigint,
-): Promise<{ announcement: { x: bigint; y: bigint }; response: bigint }> => {
-  const res = await fetch(`${attestationApiUrl}/attest`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      annualRevenueKrw: annualRevenueKrw.toString(),
-      debtRatioBps: debtRatioBps.toString(),
-      overdueCount: overdueCount.toString(),
-      companyCommitmentHash: companyCommitmentHash.toString(),
+  secretPin: bigint,
+  attestationApiUrl: string,
+): Promise<PreparedEligibilityVerification> => {
+  const giwa = validateGiwaDeploymentConfig(configuredGiwa);
+  const persistedState = await providers.privateStateProvider.get('gasokEligibilityPrivateState');
+  if (!persistedState) {
+    throw new Error('No private state found');
+  }
+
+  // A previous interrupted run may have stopped after writing witness inputs.
+  // Clear those values before creating a new request; the stable company secret
+  // remains unchanged.
+  const currentState = sanitizeEligibilityPrivateState(persistedState);
+  if (hasTransientEligibilityData(persistedState)) {
+    await providers.privateStateProvider.set('gasokEligibilityPrivateState', currentState);
+    logger.info('Cleared transient financial witness data from private state');
+  }
+
+  const contractAddress = normalizeMidnightContractAddress(contract.deployTxData.public.contractAddress);
+  const companyCommitment = deriveCompanyCommitment(currentState.companySecretKey, secretPin);
+  const companyCommitmentHash = transientHash(bytes32Type, companyCommitment);
+  logger.info('Computed pseudonymous company commitment hash for mock attestation');
+
+  const expectedContext: AuthorizationExpectedContext = {
+    midnightContractAddress: contractAddress,
+    onchainReceivableId,
+    subjectRole,
+    giwa,
+  };
+  const authorizationRequest = createAuthorizationChallengeRequest(
+    annualRevenueKrw,
+    debtRatioBps,
+    overdueCount,
+    companyCommitmentHash,
+    expectedContext,
+    generateAuthorizationSalt(),
+  );
+
+  logger.info('Requesting one-time GIWA role-wallet authorization from the local mock provider...');
+  const authorizationChallenge = await fetchAuthorizationChallenge(
+    attestationApiUrl,
+    authorizationRequest,
+    expectedContext,
+  );
+
+  return Object.freeze({
+    authorizationChallenge,
+    authorizationRequest,
+    companyCommitment,
+    expectedContext,
+    inputs: Object.freeze({
+      annualRevenueKrw,
+      debtRatioBps,
+      overdueCount,
+      secretPin,
     }),
   });
-  if (!res.ok) {
-    throw new Error(`Mock Attestation API error: ${res.status} ${await res.text()}`);
+};
+
+export const prepareEligibilityVerification = async (
+  contract: DeployedGasokEligibilityContract,
+  providers: GasokEligibilityProviders,
+  onchainReceivableId: bigint,
+  subjectRole: SubjectRole,
+  annualRevenueKrw: bigint,
+  debtRatioBps: bigint,
+  overdueCount: bigint,
+  secretPin: bigint,
+  attestationApiUrl: string,
+): Promise<PreparedEligibilityVerification> => {
+  const ledgerState = await getGasokEligibilityLedgerState(providers, contract.deployTxData.public.contractAddress);
+  if (ledgerState === null) {
+    throw new Error('The GASOK Financial Eligibility contract state is unavailable.');
   }
-  const data = (await res.json()) as { signature: { announcement: { x: string; y: string }; response: string } };
+  return await prepareEligibilityVerificationWithGiwaConfig(
+    contract,
+    providers,
+    {
+      chainId: ledgerState.giwaChainId,
+      receivableFinanceAddress: ledgerState.receivableFinanceAddress,
+    },
+    onchainReceivableId,
+    subjectRole,
+    annualRevenueKrw,
+    debtRatioBps,
+    overdueCount,
+    secretPin,
+    attestationApiUrl,
+  );
+};
+
+export const completeEligibilityVerification = async (
+  contract: DeployedGasokEligibilityContract,
+  providers: GasokEligibilityProviders,
+  prepared: PreparedEligibilityVerification,
+  authorizationValue: unknown,
+  attestationApiUrl: string,
+  options: CompleteEligibilityVerificationOptions = {},
+): Promise<EligibilityVerification> => {
+  const currentState = await providers.privateStateProvider.get('gasokEligibilityPrivateState');
+  if (!currentState) {
+    throw new Error('No private state found');
+  }
+
+  const contractAddress = normalizeMidnightContractAddress(contract.deployTxData.public.contractAddress);
+  if (contractAddress !== prepared.expectedContext.midnightContractAddress) {
+    throw new Error('The prepared authorization belongs to a different Midnight contract.');
+  }
+
+  const recomputedCompanyCommitment = deriveCompanyCommitment(
+    currentState.companySecretKey,
+    prepared.inputs.secretPin,
+  );
+  if (!Buffer.from(recomputedCompanyCommitment).equals(Buffer.from(prepared.companyCommitment))) {
+    throw new Error('The local private identity changed after the authorization request was created.');
+  }
+
+  const authorization = validateAuthorizationProof(
+    authorizationValue,
+    prepared.authorizationChallenge,
+  );
+
+  options.onStage?.('attesting');
+  logger.info('Fetching the authorized mock attestation from the local provider...');
+  const attestation = await fetchAttestation(
+    attestationApiUrl,
+    prepared.authorizationRequest,
+    authorization,
+    {
+      ...prepared.expectedContext,
+      partyWallet: prepared.authorizationChallenge.message.partyWallet,
+    },
+  );
+
+  const subject: GasokEligibility.GiwaReceivableSubject = {
+    receivableId: receivableIdToBytes(prepared.expectedContext.onchainReceivableId),
+    subjectRole: subjectRoleToCode(prepared.expectedContext.subjectRole),
+    partyWallet: fixedHexToBytes(attestation.binding.partyWallet, 20, 'Attested party wallet', {
+      requirePrefix: true,
+    }),
+  };
+  const bindingHash = deriveGiwaReceivableBindingHash(prepared.expectedContext.giwa, subject);
+  const deploymentHash = deriveMidnightDeploymentHash(contractAddress);
+  const lookupKey = deriveReceivableEligibilityKey(
+    prepared.companyCommitment,
+    bindingHash,
+    deploymentHash,
+  );
+  logger.info('Computed the opaque receivable eligibility lookup key');
+
+  const sanitizedState = sanitizeEligibilityPrivateState(currentState);
+  const witnessState: GasokEligibilityPrivateState = {
+    ...sanitizedState,
+    annualRevenueKrw: prepared.inputs.annualRevenueKrw,
+    debtRatioBps: prepared.inputs.debtRatioBps,
+    overdueCount: prepared.inputs.overdueCount,
+    attestationSignature: attestation.signature,
+    attestationProviderId: attestation.providerId,
+  };
+
+  let witnessStateWriteWasAttempted = false;
+  let finalizedTxData: FinalizedTxData | undefined;
+  let proofFailure: unknown;
+  let proofFailed = false;
+  try {
+    // Mark the attempt before awaiting the encrypted write. A storage provider
+    // can persist data and still reject later (for example during a flush), so
+    // cleanup must run even when this promise does not resolve successfully.
+    witnessStateWriteWasAttempted = true;
+    await providers.privateStateProvider.set('gasokEligibilityPrivateState', witnessState);
+    logger.info(`Private witness prepared with mock attestation (provider ${attestation.providerId})`);
+
+    options.onStage?.('proving_and_submitting');
+    logger.info('Generating and submitting GASOK financial eligibility proof...');
+    const callResult = await contract.callTx.verifyEligibility(prepared.inputs.secretPin, subject);
+    finalizedTxData = callResult.public as FinalizedTxData;
+  } catch (error: unknown) {
+    proofFailed = true;
+    proofFailure = error;
+  }
+
+  if (witnessStateWriteWasAttempted) {
+    let cleanupSucceeded = false;
+    for (let attempt = 0; attempt < 2 && !cleanupSucceeded; attempt += 1) {
+      try {
+        await providers.privateStateProvider.set('gasokEligibilityPrivateState', sanitizedState);
+        cleanupSucceeded = true;
+      } catch {
+        // Cleanup is idempotent and safe to retry. Never include the storage
+        // exception in logs because a provider error may reflect witness data.
+      }
+    }
+    if (cleanupSucceeded) {
+      logger.info('Cleared transient financial witness data from private state');
+    } else {
+      logger.error(
+        { code: 'PRIVATE_STATE_CLEANUP_PENDING' },
+        'Transient witness cleanup must be retried before another proof session.',
+      );
+    }
+  }
+
+  if (proofFailed) {
+    throw proofFailure;
+  }
+  if (finalizedTxData === undefined) {
+    throw new Error('The finalized Midnight transaction result is unavailable.');
+  }
+
+  logger.info(`Transaction ${finalizedTxData.txId} added in block ${finalizedTxData.blockHeight}`);
   return {
-    announcement: { x: BigInt(data.signature.announcement.x), y: BigInt(data.signature.announcement.y) },
-    response: BigInt(data.signature.response),
+    finalizedTxData,
+    proofCapability: {
+      version: 1,
+      midnightContractAddress: contractAddress,
+      companyCommitment: bytesToHex(prepared.companyCommitment),
+      lookupKey: bytesToHex(lookupKey),
+      giwaChainId: prepared.expectedContext.giwa.chainId.toString(),
+      receivableFinanceAddress: bytesToHex(prepared.expectedContext.giwa.receivableFinanceAddress),
+      onchainReceivableId: prepared.expectedContext.onchainReceivableId.toString(),
+      subjectRole: prepared.expectedContext.subjectRole,
+      partyWallet: attestation.binding.partyWallet,
+    },
   };
 };
 
 export const verifyEligibility = async (
   contract: DeployedGasokEligibilityContract,
   providers: GasokEligibilityProviders,
+  onchainReceivableId: bigint,
+  subjectRole: SubjectRole,
   annualRevenueKrw: bigint,
   debtRatioBps: bigint,
   overdueCount: bigint,
   secretPin: bigint,
   attestationApiUrl: string,
-): Promise<FinalizedTxData> => {
-  const currentState = await providers.privateStateProvider.get('gasokEligibilityPrivateState');
-  if (!currentState) {
-    throw new Error('No private state found');
-  }
-
-  const companyCommitmentHash = computeCompanyCommitmentHash(currentState.companySecretKey, secretPin);
-  logger.info('Computed pseudonymous company commitment hash for mock attestation');
-
-  logger.info(`Fetching mock attestation from ${attestationApiUrl}...`);
-  const signature = await fetchAttestation(
+  authorizeRoleWallet: RoleAuthorizationCallback,
+): Promise<EligibilityVerification> => {
+  const prepared = await prepareEligibilityVerification(
+    contract,
+    providers,
+    onchainReceivableId,
+    subjectRole,
+    annualRevenueKrw,
+    debtRatioBps,
+    overdueCount,
+    secretPin,
     attestationApiUrl,
-    annualRevenueKrw,
-    debtRatioBps,
-    overdueCount,
-    companyCommitmentHash,
   );
-
-  const providerRes = await fetch(`${attestationApiUrl}/provider-info`);
-  if (!providerRes.ok) {
-    throw new Error(`Mock provider info error: ${providerRes.status} ${await providerRes.text()}`);
-  }
-  const providerInfo = (await providerRes.json()) as { providerId: number };
-
-  const updatedState: GasokEligibilityPrivateState = {
-    ...currentState,
-    annualRevenueKrw,
-    debtRatioBps,
-    overdueCount,
-    attestationSignature: signature,
-    attestationProviderId: BigInt(providerInfo.providerId),
-  };
-  await providers.privateStateProvider.set('gasokEligibilityPrivateState', updatedState);
-  logger.info(`Private state updated with mock attestation (provider ${providerInfo.providerId})`);
-
-  logger.info('Generating and submitting GASOK financial eligibility proof...');
-  const finalizedTxData = await contract.callTx.verifyEligibility(secretPin);
-  logger.info(`Transaction ${finalizedTxData.public.txId} added in block ${finalizedTxData.public.blockHeight}`);
-  return finalizedTxData.public;
+  return await completeEligibilityVerification(
+    contract,
+    providers,
+    prepared,
+    await authorizeRoleWallet(prepared.authorizationChallenge),
+    attestationApiUrl,
+  );
 };
 
 // Hand the admin role over by writing the new admin's derived public key
@@ -275,12 +954,14 @@ export const displayContractState = async (
     logger.info(`There is no GASOK Financial Eligibility contract deployed at ${contractAddress}.`);
   } else {
     logger.info(`Contract address: ${contractAddress}`);
+    logger.info(`Sealed GIWA chain ID: ${ledgerState.giwaChainId}`);
+    logger.info(`Sealed ReceivableFinance address: ${bytesToHex(ledgerState.receivableFinanceAddress)}`);
     logger.info(`Admin public key: ${Buffer.from(ledgerState.contractAdmin).toString('hex')}`);
     logger.info(`Registered providers: ${ledgerState.providers.size()}`);
     logger.info(`Public eligibility results: ${ledgerState.eligibilityResults.size()}`);
-    for (const [commitment, result] of ledgerState.eligibilityResults) {
+    for (const [lookupKey, result] of ledgerState.eligibilityResults) {
       logger.info(
-        `Commitment ${Buffer.from(commitment).toString('hex')}: eligible=${result.eligible}, ` +
+        `Lookup key ${bytesToHex(lookupKey)}: eligible=${result.eligible}, ` +
           `providerId=${result.providerId}, policyVersion=${result.policyVersion}`,
       );
     }
@@ -550,7 +1231,7 @@ export const initWalletWithSeed = async (seed: Buffer, config: Config): Promise<
  * Build wallet from mnemonic and wait for funds
  */
 export const buildWalletAndWaitForFunds = async (config: Config, mnemonic: string): Promise<WalletContext> => {
-  logger.info('Building wallet from mnemonic...');
+  logger.info('Building wallet from the provided recovery phrase...');
 
   const seed = await mnemonicToSeed(mnemonic);
   const walletContext = await initWalletWithSeed(seed, config);
@@ -585,11 +1266,7 @@ export const randomBytes = (length: number): Uint8Array => {
 /**
  * Generate a fresh wallet with random mnemonic
  */
-export const buildFreshWallet = async (config: Config): Promise<WalletContext> => {
-  const mnemonic = bip39.generateMnemonic(english, 256);
-  logger.info(`Generated new wallet mnemonic: ${mnemonic}`);
-  return await buildWalletAndWaitForFunds(config, mnemonic);
-};
+export const generateFreshWalletMnemonic = (): string => bip39.generateMnemonic(english, 256);
 
 /**
  * Build wallet from hex seed (for backwards compatibility with genesis wallet)

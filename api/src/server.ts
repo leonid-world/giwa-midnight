@@ -1,14 +1,20 @@
 import { createServer as createHttpServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { PublicApiError, invalidContractAddress, unapprovedContractAddress } from './errors.js';
+import { verifyProofCapability } from './capability.js';
+import {
+  invalidJsonBody,
+  jsonBodyRequired,
+  PublicApiError,
+  requestBodyTooLarge,
+} from './errors.js';
 import { NETWORK_ID } from './config.js';
-import type { GetEligibilityResults } from './eligibility.js';
-import type { ErrorJson } from './types.js';
+import type { GetEligibilityResult } from './eligibility.js';
+import type { EligibilityResolutionJson, ErrorJson } from './types.js';
 
-const ELIGIBILITY_PATH = /^\/v1\/contracts\/([^/]+)\/eligibility-results$/;
-const CONTRACT_ADDRESS = /^[0-9a-fA-F]{64}$/;
+const RESOLVE_PATH = '/v1/eligibility-results/resolve';
+const MAX_JSON_BODY_BYTES = 4_096;
 
 export interface ApiServerDependencies {
-  readonly getEligibilityResults: GetEligibilityResults;
+  readonly getEligibilityResult: GetEligibilityResult;
   readonly approvedContractAddress: string;
 }
 
@@ -41,17 +47,56 @@ function pathnameOf(request: IncomingMessage): string {
   }
 }
 
-export function createApiServer({ getEligibilityResults, approvedContractAddress }: ApiServerDependencies): Server {
+function requireJsonContentType(request: IncomingMessage): void {
+  const contentType = request.headers['content-type'];
+  if (
+    typeof contentType !== 'string' ||
+    contentType.split(';', 1)[0].trim().toLowerCase() !== 'application/json'
+  ) {
+    throw jsonBodyRequired();
+  }
+}
+
+async function readJsonBody(request: IncomingMessage): Promise<unknown> {
+  const contentLength = request.headers['content-length'];
+  if (
+    typeof contentLength === 'string' &&
+    /^\d+$/.test(contentLength) &&
+    Number(contentLength) > MAX_JSON_BODY_BYTES
+  ) {
+    request.resume();
+    throw requestBodyTooLarge();
+  }
+
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of request) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    size += buffer.length;
+    if (size > MAX_JSON_BODY_BYTES) {
+      request.resume();
+      throw requestBodyTooLarge();
+    }
+    chunks.push(buffer);
+  }
+
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString('utf8')) as unknown;
+  } catch {
+    throw invalidJsonBody();
+  }
+}
+
+export function createApiServer({ getEligibilityResult, approvedContractAddress }: ApiServerDependencies): Server {
   return createHttpServer(async (request, response) => {
     const pathname = pathnameOf(request);
 
-    if (request.method !== 'GET') {
-      response.setHeader('Allow', 'GET');
-      sendError(response, new PublicApiError(405, 'METHOD_NOT_ALLOWED', 'Only GET requests are supported.'));
-      return;
-    }
-
     if (pathname === '/health') {
+      if (request.method !== 'GET') {
+        response.setHeader('Allow', 'GET');
+        sendError(response, new PublicApiError(405, 'METHOD_NOT_ALLOWED', 'Only GET is supported for this endpoint.'));
+        return;
+      }
       sendJson(response, 200, {
         status: 'ok',
         service: 'gasok-midnight-read-api',
@@ -60,28 +105,42 @@ export function createApiServer({ getEligibilityResults, approvedContractAddress
       return;
     }
 
-    const match = ELIGIBILITY_PATH.exec(pathname);
-    if (match === null) {
+    if (pathname !== RESOLVE_PATH) {
       sendError(response, new PublicApiError(404, 'NOT_FOUND', 'The requested endpoint does not exist.'));
       return;
     }
 
-    const contractAddress = match[1];
-    if (!CONTRACT_ADDRESS.test(contractAddress)) {
-      sendError(response, invalidContractAddress());
-      return;
-    }
-
-    const normalizedContractAddress = contractAddress.toLowerCase();
-    if (normalizedContractAddress !== approvedContractAddress) {
-      sendError(response, unapprovedContractAddress());
+    if (request.method !== 'POST') {
+      response.setHeader('Allow', 'POST');
+      sendError(response, new PublicApiError(405, 'METHOD_NOT_ALLOWED', 'Only POST is supported for this endpoint.'));
       return;
     }
 
     try {
-      const result = await getEligibilityResults(normalizedContractAddress);
-      sendJson(response, 200, result);
-    } catch (error) {
+      requireJsonContentType(request);
+      const requestBody = await readJsonBody(request);
+      const verified = verifyProofCapability(requestBody, approvedContractAddress);
+      const result = await getEligibilityResult(
+        verified.capability.midnightContractAddress,
+        verified.lookupKeyBytes,
+      );
+      const responseBody: EligibilityResolutionJson = {
+        networkId: NETWORK_ID,
+        contractAddress: verified.capability.midnightContractAddress,
+        context: {
+          giwaChainId: verified.capability.giwaChainId,
+          receivableFinanceAddress: verified.capability.receivableFinanceAddress,
+          onchainReceivableId: verified.capability.onchainReceivableId,
+          subjectRole: verified.capability.subjectRole,
+          partyWallet: verified.capability.partyWallet,
+        },
+        result: {
+          lookupKey: verified.capability.lookupKey,
+          ...result,
+        },
+      };
+      sendJson(response, 200, responseBody);
+    } catch (error: unknown) {
       if (error instanceof PublicApiError) {
         sendError(response, error);
       } else {

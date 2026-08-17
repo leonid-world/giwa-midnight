@@ -5,7 +5,7 @@ import { createApiServer } from './server.js';
 const port = getApiPort();
 const approvedContractAddress = getApprovedContractAddress();
 const server = createApiServer({
-  getEligibilityResults: createLocalEligibilityReader(),
+  getEligibilityResult: createLocalEligibilityReader(),
   approvedContractAddress,
 });
 

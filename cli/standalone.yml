@@ -3,6 +3,11 @@ services:
     container_name: 'zkloan-proof-server'
     image: 'midnightntwrk/proof-server:8.1.0'
     command: ['midnight-proof-server -v']
+    # Docker Desktop's embedded DNS can fail to follow macOS hotspot DNS.
+    # Keep this override scoped to the stateless proof server only.
+    dns:
+      - '1.1.1.1'
+      - '8.8.8.8'
     ports:
       - '127.0.0.1:6300:6300'
     environment:
