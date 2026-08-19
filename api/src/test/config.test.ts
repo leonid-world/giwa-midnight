@@ -9,7 +9,7 @@ import {
 describe('read adapter deployment pinning', () => {
   it('defaults to the successful Phase 2.5 local Midnight deployment', () => {
     expect(DEFAULT_GASOK_CONTRACT_ADDRESS).toBe(
-      '7e3ea9d741ce0f5862db6f46d0ad720be2586cd7d0405ec77e4a0478aa50f4fb',
+      '12caaf76aef1de1c584b67462018810f6e4e7eb2535e136f560cb621e24a3f36',
     );
     expect(getApprovedContractAddress(undefined)).toBe(DEFAULT_GASOK_CONTRACT_ADDRESS);
   });

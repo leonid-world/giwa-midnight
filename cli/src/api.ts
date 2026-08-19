@@ -83,6 +83,11 @@ import {
   type SubjectRole,
 } from './giwa';
 import {
+  parseLocalAttestationApiError,
+  type LocalAttestationPath,
+} from './attestation-errors.js';
+import { classifyEligibilityCallTxError } from './proof-errors.js';
+import {
   AUTHORIZATION_PROVIDER_ID,
   createAuthorizationChallengeRequest,
   generateAuthorizationSalt,
@@ -92,6 +97,7 @@ import {
   type AuthorizationChallengeRequest,
   type AuthorizationExpectedContext,
   type AuthorizationProof,
+  type FunderPolicyRequestInput,
   type RoleAuthorizationCallback,
 } from './authorization';
 
@@ -180,7 +186,7 @@ export const deploy = async (
 
 const bytes32Type = new CompactTypeBytes(32);
 const { pureCircuits } = GasokEligibility;
-const POLICY_VERSION = 1;
+const EVALUATION_VERSION = 2 as const;
 
 export interface AttestedReceivableBinding {
   readonly giwaChainId: bigint;
@@ -193,13 +199,17 @@ export interface AttestedReceivableBinding {
 export interface ValidatedMockAttestation {
   readonly signature: { announcement: { x: bigint; y: bigint }; response: bigint };
   readonly providerId: bigint;
-  readonly policyVersion: 1;
+  readonly evaluationVersion: 2;
+  readonly policyRequestHash: string;
+  readonly profileAsOf: bigint;
+  readonly validUntil: bigint;
   readonly midnightContractAddress: string;
   readonly binding: AttestedReceivableBinding;
 }
 
 export interface ProofCapability {
-  readonly version: 1;
+  readonly version: 2;
+  readonly evaluationVersion: 2;
   readonly midnightContractAddress: string;
   readonly companyCommitment: string;
   readonly lookupKey: string;
@@ -208,6 +218,14 @@ export interface ProofCapability {
   readonly onchainReceivableId: string;
   readonly subjectRole: SubjectRole;
   readonly partyWallet: string;
+  readonly requestId: string;
+  readonly intendedFunderWallet: string;
+  readonly minAnnualRevenueKrw: string;
+  readonly maxDebtRatioBps: string;
+  readonly maxOverdueCount: string;
+  readonly policyRequestHash: string;
+  readonly profileAsOf: string;
+  readonly validUntil: string;
 }
 
 export interface EligibilityVerification {
@@ -226,16 +244,19 @@ export interface PreparedEligibilityVerification {
     readonly annualRevenueKrw: bigint;
     readonly debtRatioBps: bigint;
     readonly overdueCount: bigint;
-    readonly secretPin: bigint;
+    readonly pseudonymNonce: bigint;
+    readonly policyRequest: FunderPolicyRequestInput;
   };
 }
 
 export interface CompleteEligibilityVerificationOptions {
-  readonly onStage?: (stage: EligibilityProofStage) => void;
+  readonly onStage?: (stage: EligibilityProofStage) => void | Promise<void>;
 }
 
 interface ExpectedAttestationContext extends AuthorizationExpectedContext {
   readonly partyWallet?: string;
+  readonly policyRequest: FunderPolicyRequestInput;
+  readonly profileAsOf: bigint;
 }
 
 type JsonRecord = Record<string, unknown>;
@@ -243,7 +264,10 @@ type JsonRecord = Record<string, unknown>;
 const ATTESTATION_RESPONSE_KEYS = [
   'signature',
   'providerId',
-  'policyVersion',
+  'evaluationVersion',
+  'policyRequestHash',
+  'profileAsOf',
+  'validUntil',
   'midnightContractAddress',
   'binding',
   'attestationType',
@@ -258,6 +282,8 @@ const ATTESTATION_BINDING_KEYS = [
   'subjectRole',
   'partyWallet',
 ] as const;
+const LOWER_BYTES32_PATTERN = /^0x[0-9a-f]{64}$/;
+const ZERO_BYTES32 = `0x${'0'.repeat(64)}`;
 
 export const ATTESTATION_REQUEST_TIMEOUT_MS = 10_000;
 export const MAX_ATTESTATION_RESPONSE_BYTES = 64 * 1024;
@@ -268,8 +294,6 @@ const INVALID_ATTESTATION_API_URL =
 class AttestationResponseTooLargeError extends Error {}
 
 class AttestationResponseAbortedError extends Error {}
-
-type LocalAttestationPath = '/attest' | '/authorization-challenges';
 
 export function resolveLocalAttestationEndpoint(
   attestationApiUrl: string,
@@ -417,14 +441,31 @@ export function parseAttestationResponse(
   if (data.attestationType !== 'mock') {
     throw new Error('Attestation response is not marked as mock data.');
   }
-  if (data.authorizationProtocol !== 'eip712-role-wallet-v1') {
+  if (data.authorizationProtocol !== 'eip712-role-wallet-v2') {
     throw new Error('Mock Attestation API returned an unsupported wallet authorization protocol.');
   }
   if (data.providerId !== AUTHORIZATION_PROVIDER_ID) {
     throw new Error('Mock Attestation API returned an unsupported providerId.');
   }
-  if (data.policyVersion !== POLICY_VERSION) {
-    throw new Error('Mock Attestation API returned an unsupported policyVersion.');
+  if (data.evaluationVersion !== EVALUATION_VERSION) {
+    throw new Error('Mock Attestation API returned an unsupported evaluationVersion.');
+  }
+  if (
+    typeof data.policyRequestHash !== 'string' ||
+    !LOWER_BYTES32_PATTERN.test(data.policyRequestHash) ||
+    data.policyRequestHash === ZERO_BYTES32
+  ) {
+    throw new Error('Mock Attestation API returned an invalid policyRequestHash.');
+  }
+  const profileAsOf = parseCanonicalDecimal(data.profileAsOf, 'profileAsOf', (1n << 64n) - 1n);
+  const validUntil = parseCanonicalDecimal(data.validUntil, 'validUntil', (1n << 64n) - 1n);
+  if (
+    profileAsOf === 0n ||
+    profileAsOf !== expected.profileAsOf ||
+    validUntil !== expected.policyRequest.validUntil ||
+    profileAsOf > validUntil
+  ) {
+    throw new Error('Mock attestation freshness metadata does not match the Funder policy request.');
   }
 
   if (typeof data.midnightContractAddress !== 'string') {
@@ -487,7 +528,10 @@ export function parseAttestationResponse(
   return {
     signature: parsedSignature,
     providerId: BigInt(data.providerId as number),
-    policyVersion: 1,
+    evaluationVersion: EVALUATION_VERSION,
+    policyRequestHash: data.policyRequestHash,
+    profileAsOf,
+    validUntil,
     midnightContractAddress,
     binding: {
       giwaChainId,
@@ -499,12 +543,24 @@ export function parseAttestationResponse(
   };
 }
 
-export const deriveCompanyCommitment = (companySecretKey: Uint8Array, pin: bigint): Uint8Array => {
-  return pureCircuits.deriveCompanyCommitment(companySecretKey, pin);
+export const deriveCompanyCommitment = (
+  companySecretKey: Uint8Array,
+  pseudonymNonce: bigint,
+  requestId: string,
+): Uint8Array => {
+  return pureCircuits.deriveCompanyCommitment(
+    companySecretKey,
+    pseudonymNonce,
+    fixedHexToBytes(requestId, 32, 'Funder policy request ID', { requirePrefix: true }),
+  );
 };
 
-export const computeCompanyCommitmentHash = (companySecretKey: Uint8Array, pin: bigint): bigint => {
-  return transientHash(bytes32Type, deriveCompanyCommitment(companySecretKey, pin));
+export const computeCompanyCommitmentHash = (
+  companySecretKey: Uint8Array,
+  pseudonymNonce: bigint,
+  requestId: string,
+): bigint => {
+  return transientHash(bytes32Type, deriveCompanyCommitment(companySecretKey, pseudonymNonce, requestId));
 };
 
 export const deriveGiwaReceivableBindingHash = (
@@ -525,9 +581,31 @@ export const deriveReceivableEligibilityKey = (
   companyCommitment: Uint8Array,
   bindingHash: Uint8Array,
   deploymentHash: Uint8Array,
+  policyRequestHash: Uint8Array,
 ): Uint8Array => {
-  return pureCircuits.deriveReceivableEligibilityKey(companyCommitment, bindingHash, deploymentHash);
+  return pureCircuits.deriveReceivableEligibilityKey(
+    companyCommitment,
+    bindingHash,
+    deploymentHash,
+    policyRequestHash,
+  );
 };
+
+export const derivePolicyRequestHash = (
+  policyRequest: FunderPolicyRequestInput,
+): Uint8Array => pureCircuits.derivePolicyRequestHash({
+  requestId: fixedHexToBytes(policyRequest.requestId, 32, 'Funder policy request ID', { requirePrefix: true }),
+  intendedFunderWallet: fixedHexToBytes(
+    policyRequest.intendedFunderWallet,
+    20,
+    'Intended Funder wallet',
+    { requirePrefix: true },
+  ),
+  minAnnualRevenueKrw: policyRequest.minAnnualRevenueKrw,
+  maxDebtRatioBps: policyRequest.maxDebtRatioBps,
+  maxOverdueCount: policyRequest.maxOverdueCount,
+  validUntil: policyRequest.validUntil,
+});
 
 async function postLocalAttestationJson(
   attestationApiUrl: string,
@@ -570,6 +648,10 @@ async function postLocalAttestationJson(
   }
 
   if (!response.ok) {
+    const publicError = parseLocalAttestationApiError(path, response.status, responseText);
+    if (publicError !== null) {
+      throw publicError;
+    }
     throw new Error(`Mock Attestation API returned HTTP ${response.status}.`);
   }
 
@@ -622,6 +704,7 @@ export const sanitizeEligibilityPrivateState = (
   overdueCount: 0n,
   attestationSignature: emptyAttestationSignature(),
   attestationProviderId: 0n,
+  attestationProfileAsOf: 0n,
 });
 
 const hasTransientEligibilityData = (privateState: GasokEligibilityPrivateState): boolean =>
@@ -631,7 +714,8 @@ const hasTransientEligibilityData = (privateState: GasokEligibilityPrivateState)
   privateState.attestationSignature.announcement.x !== 0n ||
   privateState.attestationSignature.announcement.y !== 0n ||
   privateState.attestationSignature.response !== 0n ||
-  privateState.attestationProviderId !== 0n;
+  privateState.attestationProviderId !== 0n ||
+  privateState.attestationProfileAsOf !== 0n;
 
 export const prepareEligibilityVerificationWithGiwaConfig = async (
   contract: DeployedGasokEligibilityContract,
@@ -642,7 +726,8 @@ export const prepareEligibilityVerificationWithGiwaConfig = async (
   annualRevenueKrw: bigint,
   debtRatioBps: bigint,
   overdueCount: bigint,
-  secretPin: bigint,
+  pseudonymNonce: bigint,
+  policyRequest: FunderPolicyRequestInput,
   attestationApiUrl: string,
 ): Promise<PreparedEligibilityVerification> => {
   const giwa = validateGiwaDeploymentConfig(configuredGiwa);
@@ -661,7 +746,11 @@ export const prepareEligibilityVerificationWithGiwaConfig = async (
   }
 
   const contractAddress = normalizeMidnightContractAddress(contract.deployTxData.public.contractAddress);
-  const companyCommitment = deriveCompanyCommitment(currentState.companySecretKey, secretPin);
+  const companyCommitment = deriveCompanyCommitment(
+    currentState.companySecretKey,
+    pseudonymNonce,
+    policyRequest.requestId,
+  );
   const companyCommitmentHash = transientHash(bytes32Type, companyCommitment);
   logger.info('Computed pseudonymous company commitment hash for mock attestation');
 
@@ -677,6 +766,7 @@ export const prepareEligibilityVerificationWithGiwaConfig = async (
     overdueCount,
     companyCommitmentHash,
     expectedContext,
+    policyRequest,
     generateAuthorizationSalt(),
   );
 
@@ -696,7 +786,8 @@ export const prepareEligibilityVerificationWithGiwaConfig = async (
       annualRevenueKrw,
       debtRatioBps,
       overdueCount,
-      secretPin,
+      pseudonymNonce,
+      policyRequest,
     }),
   });
 };
@@ -709,7 +800,8 @@ export const prepareEligibilityVerification = async (
   annualRevenueKrw: bigint,
   debtRatioBps: bigint,
   overdueCount: bigint,
-  secretPin: bigint,
+  pseudonymNonce: bigint,
+  policyRequest: FunderPolicyRequestInput,
   attestationApiUrl: string,
 ): Promise<PreparedEligibilityVerification> => {
   const ledgerState = await getGasokEligibilityLedgerState(providers, contract.deployTxData.public.contractAddress);
@@ -728,7 +820,8 @@ export const prepareEligibilityVerification = async (
     annualRevenueKrw,
     debtRatioBps,
     overdueCount,
-    secretPin,
+    pseudonymNonce,
+    policyRequest,
     attestationApiUrl,
   );
 };
@@ -753,7 +846,8 @@ export const completeEligibilityVerification = async (
 
   const recomputedCompanyCommitment = deriveCompanyCommitment(
     currentState.companySecretKey,
-    prepared.inputs.secretPin,
+    prepared.inputs.pseudonymNonce,
+    prepared.inputs.policyRequest.requestId,
   );
   if (!Buffer.from(recomputedCompanyCommitment).equals(Buffer.from(prepared.companyCommitment))) {
     throw new Error('The local private identity changed after the authorization request was created.');
@@ -764,7 +858,7 @@ export const completeEligibilityVerification = async (
     prepared.authorizationChallenge,
   );
 
-  options.onStage?.('attesting');
+  await options.onStage?.('attesting');
   logger.info('Fetching the authorized mock attestation from the local provider...');
   const attestation = await fetchAttestation(
     attestationApiUrl,
@@ -773,8 +867,15 @@ export const completeEligibilityVerification = async (
     {
       ...prepared.expectedContext,
       partyWallet: prepared.authorizationChallenge.message.partyWallet,
+      policyRequest: prepared.inputs.policyRequest,
+      profileAsOf: BigInt(prepared.authorizationChallenge.message.profileAsOf),
     },
   );
+
+  const policyRequestHash = derivePolicyRequestHash(prepared.inputs.policyRequest);
+  if (attestation.policyRequestHash !== bytesToHex(policyRequestHash)) {
+    throw new Error('Mock attestation is bound to a different Funder policy request.');
+  }
 
   const subject: GasokEligibility.GiwaReceivableSubject = {
     receivableId: receivableIdToBytes(prepared.expectedContext.onchainReceivableId),
@@ -789,6 +890,7 @@ export const completeEligibilityVerification = async (
     prepared.companyCommitment,
     bindingHash,
     deploymentHash,
+    policyRequestHash,
   );
   logger.info('Computed the opaque receivable eligibility lookup key');
 
@@ -800,6 +902,7 @@ export const completeEligibilityVerification = async (
     overdueCount: prepared.inputs.overdueCount,
     attestationSignature: attestation.signature,
     attestationProviderId: attestation.providerId,
+    attestationProfileAsOf: attestation.profileAsOf,
   };
 
   let witnessStateWriteWasAttempted = false;
@@ -814,9 +917,35 @@ export const completeEligibilityVerification = async (
     await providers.privateStateProvider.set('gasokEligibilityPrivateState', witnessState);
     logger.info(`Private witness prepared with mock attestation (provider ${attestation.providerId})`);
 
-    options.onStage?.('proving_and_submitting');
+    await options.onStage?.('proving_and_submitting');
     logger.info('Generating and submitting GASOK financial eligibility proof...');
-    const callResult = await contract.callTx.verifyEligibility(prepared.inputs.secretPin, subject);
+    let callResult;
+    try {
+      callResult = await contract.callTx.verifyEligibility(
+        prepared.inputs.pseudonymNonce,
+        subject,
+        {
+          requestId: fixedHexToBytes(
+            prepared.inputs.policyRequest.requestId,
+            32,
+            'Funder policy request ID',
+            { requirePrefix: true },
+          ),
+          intendedFunderWallet: fixedHexToBytes(
+            prepared.inputs.policyRequest.intendedFunderWallet,
+            20,
+            'Intended Funder wallet',
+            { requirePrefix: true },
+          ),
+          minAnnualRevenueKrw: prepared.inputs.policyRequest.minAnnualRevenueKrw,
+          maxDebtRatioBps: prepared.inputs.policyRequest.maxDebtRatioBps,
+          maxOverdueCount: prepared.inputs.policyRequest.maxOverdueCount,
+          validUntil: prepared.inputs.policyRequest.validUntil,
+        },
+      );
+    } catch (error: unknown) {
+      throw classifyEligibilityCallTxError(error) ?? error;
+    }
     finalizedTxData = callResult.public as FinalizedTxData;
   } catch (error: unknown) {
     proofFailed = true;
@@ -855,7 +984,8 @@ export const completeEligibilityVerification = async (
   return {
     finalizedTxData,
     proofCapability: {
-      version: 1,
+      version: 2,
+      evaluationVersion: EVALUATION_VERSION,
       midnightContractAddress: contractAddress,
       companyCommitment: bytesToHex(prepared.companyCommitment),
       lookupKey: bytesToHex(lookupKey),
@@ -864,6 +994,14 @@ export const completeEligibilityVerification = async (
       onchainReceivableId: prepared.expectedContext.onchainReceivableId.toString(),
       subjectRole: prepared.expectedContext.subjectRole,
       partyWallet: attestation.binding.partyWallet,
+      requestId: prepared.inputs.policyRequest.requestId,
+      intendedFunderWallet: prepared.inputs.policyRequest.intendedFunderWallet,
+      minAnnualRevenueKrw: prepared.inputs.policyRequest.minAnnualRevenueKrw.toString(),
+      maxDebtRatioBps: prepared.inputs.policyRequest.maxDebtRatioBps.toString(),
+      maxOverdueCount: prepared.inputs.policyRequest.maxOverdueCount.toString(),
+      policyRequestHash: bytesToHex(policyRequestHash),
+      profileAsOf: attestation.profileAsOf.toString(),
+      validUntil: attestation.validUntil.toString(),
     },
   };
 };
@@ -876,7 +1014,8 @@ export const verifyEligibility = async (
   annualRevenueKrw: bigint,
   debtRatioBps: bigint,
   overdueCount: bigint,
-  secretPin: bigint,
+  pseudonymNonce: bigint,
+  policyRequest: FunderPolicyRequestInput,
   attestationApiUrl: string,
   authorizeRoleWallet: RoleAuthorizationCallback,
 ): Promise<EligibilityVerification> => {
@@ -888,7 +1027,8 @@ export const verifyEligibility = async (
     annualRevenueKrw,
     debtRatioBps,
     overdueCount,
-    secretPin,
+    pseudonymNonce,
+    policyRequest,
     attestationApiUrl,
   );
   return await completeEligibilityVerification(
@@ -916,9 +1056,9 @@ export const rotateAdmin = async (
 
 // Compute the AdminPublicKey for a given user secret. Run by a prospective
 // new admin to obtain the 32-byte public key they hand to the current admin.
-// Same `userSecretKey` is used for both per-user identity (PIN-bound) and
-// the admin role (no PIN) — different domain separators inside the contract
-// keep them logically independent.
+// The same company secret is used for request-scoped pseudonyms and the admin
+// role. Different domain separators inside the contract keep those derivations
+// logically independent; neither the nonce nor the secret crosses the wire.
 export const deriveAdminPublicKey = (companySecretKey: Uint8Array): Uint8Array => {
   return pureCircuits.deriveAdminPublicKey(companySecretKey);
 };
@@ -962,7 +1102,8 @@ export const displayContractState = async (
     for (const [lookupKey, result] of ledgerState.eligibilityResults) {
       logger.info(
         `Lookup key ${bytesToHex(lookupKey)}: eligible=${result.eligible}, ` +
-          `providerId=${result.providerId}, policyVersion=${result.policyVersion}`,
+          `providerId=${result.providerId}, evaluationVersion=${result.evaluationVersion}, ` +
+          `profileAsOf=${result.profileAsOf}, validUntil=${result.validUntil}`,
       );
     }
   }

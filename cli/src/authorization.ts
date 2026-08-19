@@ -29,15 +29,16 @@ import {
   type SubjectRole,
 } from './giwa';
 
-export const AUTHORIZATION_VERSION = 1 as const;
+export const AUTHORIZATION_VERSION = 2 as const;
 export const AUTHORIZATION_PROVIDER_ID = 2 as const;
-export const AUTHORIZATION_POLICY_VERSION = 1 as const;
+export const AUTHORIZATION_EVALUATION_VERSION = 2 as const;
 export const AUTHORIZATION_TTL_SECONDS = 120n;
 export const AUTHORIZATION_PRIMARY_TYPE = 'GASOKRoleAttestationAuthorization' as const;
-export const AUTHORIZATION_PURPOSE = 'Authorize GASOK local mock financial attestation' as const;
+export const AUTHORIZATION_PURPOSE =
+  'Authorize GASOK local mock financial attestation for a Funder policy request' as const;
 export const MAX_AUTHORIZATION_PROOF_JSON_BYTES = 4_096;
 
-const ATTESTATION_REQUEST_DOMAIN = id('gasok:mock-attestation-request:v1');
+const ATTESTATION_REQUEST_DOMAIN = id('gasok:mock-attestation-request:v2');
 const BYTES32_PATTERN = /^0x[0-9a-fA-F]{64}$/;
 const LOWER_BYTES32_PATTERN = /^0x[0-9a-f]{64}$/;
 const ZERO_BYTES32 = `0x${'0'.repeat(64)}`;
@@ -47,7 +48,7 @@ const abiCoder = AbiCoder.defaultAbiCoder();
 
 export const AUTHORIZATION_DOMAIN = Object.freeze({
   name: 'GASOK Mock Attestation' as const,
-  version: '1' as const,
+  version: '2' as const,
   chainId: GIWA_CHAIN_ID.toString(),
 });
 
@@ -59,9 +60,16 @@ export const AUTHORIZATION_FIELDS = Object.freeze([
   Object.freeze({ name: 'onchainReceivableId', type: 'uint256' }),
   Object.freeze({ name: 'subjectRole', type: 'string' }),
   Object.freeze({ name: 'partyWallet', type: 'address' }),
+  Object.freeze({ name: 'requestId', type: 'bytes32' }),
+  Object.freeze({ name: 'intendedFunderWallet', type: 'address' }),
+  Object.freeze({ name: 'minAnnualRevenueKrw', type: 'uint64' }),
+  Object.freeze({ name: 'maxDebtRatioBps', type: 'uint32' }),
+  Object.freeze({ name: 'maxOverdueCount', type: 'uint16' }),
   Object.freeze({ name: 'attestationRequestCommitment', type: 'bytes32' }),
   Object.freeze({ name: 'providerId', type: 'uint16' }),
-  Object.freeze({ name: 'policyVersion', type: 'uint16' }),
+  Object.freeze({ name: 'evaluationVersion', type: 'uint16' }),
+  Object.freeze({ name: 'profileAsOf', type: 'uint64' }),
+  Object.freeze({ name: 'policyValidUntil', type: 'uint64' }),
   Object.freeze({ name: 'issuedAt', type: 'uint64' }),
   Object.freeze({ name: 'expiresAt', type: 'uint64' }),
 ]);
@@ -70,8 +78,26 @@ const ETHERS_AUTHORIZATION_TYPES: Record<string, Array<TypedDataField>> = {
   [AUTHORIZATION_PRIMARY_TYPE]: AUTHORIZATION_FIELDS.map((field) => ({ ...field })),
 };
 
+export interface FunderPolicyRequestInput {
+  readonly requestId: string;
+  readonly intendedFunderWallet: string;
+  readonly minAnnualRevenueKrw: bigint;
+  readonly maxDebtRatioBps: bigint;
+  readonly maxOverdueCount: bigint;
+  readonly validUntil: bigint;
+}
+
+export interface FunderPolicyRequestWire {
+  readonly requestId: string;
+  readonly intendedFunderWallet: string;
+  readonly minAnnualRevenueKrw: string;
+  readonly maxDebtRatioBps: string;
+  readonly maxOverdueCount: string;
+  readonly validUntil: string;
+}
+
 export interface AuthorizationChallengeRequest {
-  readonly version: 1;
+  readonly version: 2;
   readonly annualRevenueKrw: string;
   readonly debtRatioBps: string;
   readonly overdueCount: string;
@@ -80,6 +106,7 @@ export interface AuthorizationChallengeRequest {
   readonly midnightContractAddress: string;
   readonly onchainReceivableId: string;
   readonly subjectRole: SubjectRole;
+  readonly policyRequest: FunderPolicyRequestWire;
 }
 
 export interface AuthorizationTypeField {
@@ -95,15 +122,22 @@ export interface AuthorizationMessage {
   readonly onchainReceivableId: string;
   readonly subjectRole: SubjectRole;
   readonly partyWallet: string;
+  readonly requestId: string;
+  readonly intendedFunderWallet: string;
+  readonly minAnnualRevenueKrw: string;
+  readonly maxDebtRatioBps: string;
+  readonly maxOverdueCount: string;
   readonly attestationRequestCommitment: string;
   readonly providerId: string;
-  readonly policyVersion: string;
+  readonly evaluationVersion: string;
+  readonly profileAsOf: string;
+  readonly policyValidUntil: string;
   readonly issuedAt: string;
   readonly expiresAt: string;
 }
 
 export interface AuthorizationChallenge {
-  readonly version: 1;
+  readonly version: 2;
   readonly domain: typeof AUTHORIZATION_DOMAIN;
   readonly primaryType: typeof AUTHORIZATION_PRIMARY_TYPE;
   readonly types: Readonly<Record<typeof AUTHORIZATION_PRIMARY_TYPE, ReadonlyArray<AuthorizationTypeField>>>;
@@ -111,7 +145,7 @@ export interface AuthorizationChallenge {
 }
 
 export interface AuthorizationProof {
-  readonly version: 1;
+  readonly version: 2;
   readonly authorizationId: string;
   readonly typedDataHash: string;
   readonly signer: string;
@@ -139,9 +173,16 @@ const MESSAGE_KEYS = [
   'onchainReceivableId',
   'subjectRole',
   'partyWallet',
+  'requestId',
+  'intendedFunderWallet',
+  'minAnnualRevenueKrw',
+  'maxDebtRatioBps',
+  'maxOverdueCount',
   'attestationRequestCommitment',
   'providerId',
-  'policyVersion',
+  'evaluationVersion',
+  'profileAsOf',
+  'policyValidUntil',
   'issuedAt',
   'expiresAt',
 ] as const;
@@ -226,6 +267,7 @@ export function createAuthorizationChallengeRequest(
   overdueCount: bigint,
   companyCommitmentHash: bigint,
   expected: AuthorizationExpectedContext,
+  policyRequest: FunderPolicyRequestInput,
   authorizationSalt: string = generateAuthorizationSalt(),
 ): AuthorizationChallengeRequest {
   assertFixedGiwaDeployment(expected);
@@ -235,12 +277,29 @@ export function createAuthorizationChallengeRequest(
     debtRatioBps < 0n || debtRatioBps > UINT32_MAX ||
     overdueCount < 0n || overdueCount > UINT16_MAX ||
     companyCommitmentHash < 0n || companyCommitmentHash > MAX_FIELD ||
-    expected.onchainReceivableId <= 0n || expected.onchainReceivableId > UINT256_MAX
+    expected.onchainReceivableId <= 0n || expected.onchainReceivableId > UINT256_MAX ||
+    policyRequest.minAnnualRevenueKrw < 0n || policyRequest.minAnnualRevenueKrw > UINT64_MAX ||
+    policyRequest.maxDebtRatioBps < 0n || policyRequest.maxDebtRatioBps > UINT32_MAX ||
+    policyRequest.maxOverdueCount < 0n || policyRequest.maxOverdueCount > UINT16_MAX ||
+    policyRequest.validUntil <= 0n || policyRequest.validUntil > UINT64_MAX
   ) {
     throw new Error('The role authorization request contains an out-of-range value.');
   }
   if (!LOWER_BYTES32_PATTERN.test(authorizationSalt) || authorizationSalt === ZERO_BYTES32) {
     throw new Error('The generated authorization salt is invalid.');
+  }
+  if (!LOWER_BYTES32_PATTERN.test(policyRequest.requestId) || policyRequest.requestId === ZERO_BYTES32) {
+    throw new Error('The Funder policy request ID is invalid.');
+  }
+  const intendedFunderWallet = normalizeEvmAddress(
+    policyRequest.intendedFunderWallet,
+    'Intended Funder wallet',
+  );
+  if (
+    intendedFunderWallet !== policyRequest.intendedFunderWallet ||
+    isZeroBytes(fixedHexToBytes(intendedFunderWallet, 20, 'Intended Funder wallet', { requirePrefix: true }))
+  ) {
+    throw new Error('The intended Funder wallet is invalid.');
   }
 
   return Object.freeze({
@@ -253,12 +312,21 @@ export function createAuthorizationChallengeRequest(
     midnightContractAddress,
     onchainReceivableId: expected.onchainReceivableId.toString(),
     subjectRole: expected.subjectRole,
+    policyRequest: Object.freeze({
+      requestId: policyRequest.requestId,
+      intendedFunderWallet,
+      minAnnualRevenueKrw: policyRequest.minAnnualRevenueKrw.toString(),
+      maxDebtRatioBps: policyRequest.maxDebtRatioBps.toString(),
+      maxOverdueCount: policyRequest.maxOverdueCount.toString(),
+      validUntil: policyRequest.validUntil.toString(),
+    }),
   });
 }
 
 export function buildAttestationRequestCommitment(
   request: AuthorizationChallengeRequest,
   partyWalletInput: string,
+  profileAsOf: string,
 ): string {
   const partyWallet = normalizeEvmAddress(partyWalletInput, 'Authorized GIWA party wallet');
   const encoded = abiCoder.encode(
@@ -277,6 +345,13 @@ export function buildAttestationRequestCommitment(
       'uint16',
       'uint16',
       'bytes32',
+      'address',
+      'uint64',
+      'uint32',
+      'uint16',
+      'uint64',
+      'uint64',
+      'bytes32',
     ],
     [
       ATTESTATION_REQUEST_DOMAIN,
@@ -291,7 +366,14 @@ export function buildAttestationRequestCommitment(
       request.subjectRole,
       partyWallet,
       AUTHORIZATION_PROVIDER_ID,
-      AUTHORIZATION_POLICY_VERSION,
+      AUTHORIZATION_EVALUATION_VERSION,
+      request.policyRequest.requestId,
+      request.policyRequest.intendedFunderWallet,
+      BigInt(request.policyRequest.minAnnualRevenueKrw),
+      BigInt(request.policyRequest.maxDebtRatioBps),
+      BigInt(request.policyRequest.maxOverdueCount),
+      BigInt(profileAsOf),
+      BigInt(request.policyRequest.validUntil),
       request.authorizationSalt,
     ],
   );
@@ -344,8 +426,14 @@ export function parseAuthorizationChallenge(
     typeof message.attestationRequestCommitment !== 'string' ||
     !LOWER_BYTES32_PATTERN.test(message.attestationRequestCommitment) ||
     message.attestationRequestCommitment === ZERO_BYTES32 ||
+    message.requestId !== request.policyRequest.requestId ||
+    message.intendedFunderWallet !== request.policyRequest.intendedFunderWallet ||
+    message.minAnnualRevenueKrw !== request.policyRequest.minAnnualRevenueKrw ||
+    message.maxDebtRatioBps !== request.policyRequest.maxDebtRatioBps ||
+    message.maxOverdueCount !== request.policyRequest.maxOverdueCount ||
     message.providerId !== AUTHORIZATION_PROVIDER_ID.toString() ||
-    message.policyVersion !== AUTHORIZATION_POLICY_VERSION.toString()
+    message.evaluationVersion !== AUTHORIZATION_EVALUATION_VERSION.toString() ||
+    message.policyValidUntil !== request.policyRequest.validUntil
   ) {
     throw invalidChallenge();
   }
@@ -360,18 +448,21 @@ export function parseAuthorizationChallenge(
   }
 
   const partyWallet = parseCanonicalPartyWallet(message.partyWallet);
-  if (message.attestationRequestCommitment !== buildAttestationRequestCommitment(request, partyWallet)) {
-    throw invalidChallenge();
-  }
-
   const issuedAt = parseCanonicalUint(message.issuedAt, UINT64_MAX);
   const expiresAt = parseCanonicalUint(message.expiresAt, UINT64_MAX);
+  const profileAsOf = parseCanonicalUint(message.profileAsOf, UINT64_MAX);
+  const policyValidUntil = parseCanonicalUint(message.policyValidUntil, UINT64_MAX);
   if (
     issuedAt > nowSeconds ||
     expiresAt <= nowSeconds ||
     expiresAt <= issuedAt ||
-    expiresAt - issuedAt > AUTHORIZATION_TTL_SECONDS
+    expiresAt - issuedAt > AUTHORIZATION_TTL_SECONDS ||
+    profileAsOf !== issuedAt ||
+    policyValidUntil <= nowSeconds
   ) {
+    throw invalidChallenge();
+  }
+  if (message.attestationRequestCommitment !== buildAttestationRequestCommitment(request, partyWallet, message.profileAsOf as string)) {
     throw invalidChallenge();
   }
 
@@ -390,9 +481,16 @@ export function parseAuthorizationChallenge(
       onchainReceivableId: message.onchainReceivableId as string,
       subjectRole: message.subjectRole as SubjectRole,
       partyWallet,
+      requestId: message.requestId as string,
+      intendedFunderWallet: message.intendedFunderWallet as string,
+      minAnnualRevenueKrw: message.minAnnualRevenueKrw as string,
+      maxDebtRatioBps: message.maxDebtRatioBps as string,
+      maxOverdueCount: message.maxOverdueCount as string,
       attestationRequestCommitment: message.attestationRequestCommitment,
       providerId: message.providerId as string,
-      policyVersion: message.policyVersion as string,
+      evaluationVersion: message.evaluationVersion as string,
+      profileAsOf: message.profileAsOf as string,
+      policyValidUntil: message.policyValidUntil as string,
       issuedAt: message.issuedAt as string,
       expiresAt: message.expiresAt as string,
     }),

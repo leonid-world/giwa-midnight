@@ -7,4 +7,5 @@ logs/
 midnight-level-db/
 reports/
 .gasok-midnight-private-state.lock
+.gasok-midnight-capability-outbox/
 *.log

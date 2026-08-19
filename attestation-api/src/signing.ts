@@ -14,8 +14,11 @@ export type FinancialAttestationMessage = [
   companyCommitmentHash: bigint,
   bindingHashField: bigint,
   deploymentHashField: bigint,
+  policyRequestHashField: bigint,
   providerId: bigint,
-  policyVersion: bigint,
+  evaluationVersion: bigint,
+  profileAsOf: bigint,
+  validUntil: bigint,
 ];
 import * as crypto from 'crypto';
 
@@ -87,8 +90,11 @@ export function signFinancialData(
   companyCommitmentHash: bigint,
   bindingHashField: bigint,
   deploymentHashField: bigint,
+  policyRequestHashField: bigint,
   providerId: bigint,
-  policyVersion: bigint,
+  evaluationVersion: bigint,
+  profileAsOf: bigint,
+  validUntil: bigint,
 ): SchnorrSignature {
   const msg = buildFinancialAttestationMessage(
     annualRevenueKrw,
@@ -97,8 +103,11 @@ export function signFinancialData(
     companyCommitmentHash,
     bindingHashField,
     deploymentHashField,
+    policyRequestHashField,
     providerId,
-    policyVersion,
+    evaluationVersion,
+    profileAsOf,
+    validUntil,
   );
   return sign(sk, msg);
 }
@@ -110,8 +119,11 @@ export function buildFinancialAttestationMessage(
   companyCommitmentHash: bigint,
   bindingHashField: bigint,
   deploymentHashField: bigint,
+  policyRequestHashField: bigint,
   providerId: bigint,
-  policyVersion: bigint,
+  evaluationVersion: bigint,
+  profileAsOf: bigint,
+  validUntil: bigint,
 ): FinancialAttestationMessage {
   return [
     annualRevenueKrw,
@@ -120,7 +132,10 @@ export function buildFinancialAttestationMessage(
     companyCommitmentHash,
     bindingHashField,
     deploymentHashField,
+    policyRequestHashField,
     providerId,
-    policyVersion,
+    evaluationVersion,
+    profileAsOf,
+    validUntil,
   ];
 }

@@ -20,10 +20,17 @@
           }
         },
         {
-          "name": "pin",
+          "name": "pseudonymNonce",
           "type": {
             "type-name": "Uint",
             "maxval": 65535
+          }
+        },
+        {
+          "name": "requestId",
+          "type": {
+            "type-name": "Bytes",
+            "length": 32
           }
         }
       ],
@@ -144,6 +151,72 @@
       }
     },
     {
+      "name": "derivePolicyRequestHash",
+      "pure": true,
+      "proof": false,
+      "arguments": [
+        {
+          "name": "request",
+          "type": {
+            "type-name": "Struct",
+            "name": "FunderPolicyRequest",
+            "elements": [
+              {
+                "name": "requestId",
+                "type": {
+                  "type-name": "Bytes",
+                  "length": 32
+                }
+              },
+              {
+                "name": "intendedFunderWallet",
+                "type": {
+                  "type-name": "Bytes",
+                  "length": 20
+                }
+              },
+              {
+                "name": "minAnnualRevenueKrw",
+                "type": {
+                  "type-name": "Uint",
+                  "maxval": 18446744073709551615
+                }
+              },
+              {
+                "name": "maxDebtRatioBps",
+                "type": {
+                  "type-name": "Uint",
+                  "maxval": 4294967295
+                }
+              },
+              {
+                "name": "maxOverdueCount",
+                "type": {
+                  "type-name": "Uint",
+                  "maxval": 65535
+                }
+              },
+              {
+                "name": "validUntil",
+                "type": {
+                  "type-name": "Uint",
+                  "maxval": 18446744073709551615
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "result-type": {
+        "type-name": "Alias",
+        "name": "PolicyRequestHash",
+        "type": {
+          "type-name": "Bytes",
+          "length": 32
+        }
+      }
+    },
+    {
       "name": "deriveReceivableEligibilityKey",
       "pure": true,
       "proof": false,
@@ -180,6 +253,17 @@
               "length": 32
             }
           }
+        },
+        {
+          "name": "policyRequestHash",
+          "type": {
+            "type-name": "Alias",
+            "name": "PolicyRequestHash",
+            "type": {
+              "type-name": "Bytes",
+              "length": 32
+            }
+          }
         }
       ],
       "result-type": {
@@ -197,7 +281,7 @@
       "proof": true,
       "arguments": [
         {
-          "name": "secretPin",
+          "name": "pseudonymNonce",
           "type": {
             "type-name": "Uint",
             "maxval": 65535
@@ -228,6 +312,57 @@
                 "type": {
                   "type-name": "Bytes",
                   "length": 20
+                }
+              }
+            ]
+          }
+        },
+        {
+          "name": "policyRequest",
+          "type": {
+            "type-name": "Struct",
+            "name": "FunderPolicyRequest",
+            "elements": [
+              {
+                "name": "requestId",
+                "type": {
+                  "type-name": "Bytes",
+                  "length": 32
+                }
+              },
+              {
+                "name": "intendedFunderWallet",
+                "type": {
+                  "type-name": "Bytes",
+                  "length": 20
+                }
+              },
+              {
+                "name": "minAnnualRevenueKrw",
+                "type": {
+                  "type-name": "Uint",
+                  "maxval": 18446744073709551615
+                }
+              },
+              {
+                "name": "maxDebtRatioBps",
+                "type": {
+                  "type-name": "Uint",
+                  "maxval": 4294967295
+                }
+              },
+              {
+                "name": "maxOverdueCount",
+                "type": {
+                  "type-name": "Uint",
+                  "maxval": 65535
+                }
+              },
+              {
+                "name": "validUntil",
+                "type": {
+                  "type-name": "Uint",
+                  "maxval": 18446744073709551615
                 }
               }
             ]
@@ -345,7 +480,7 @@
           "name": "msg",
           "type": {
             "type-name": "Vector",
-            "length": 8,
+            "length": 11,
             "type": {
               "type-name": "Field"
             }
@@ -441,6 +576,10 @@
           {
             "type-name": "Uint",
             "maxval": 65535
+          },
+          {
+            "type-name": "Uint",
+            "maxval": 18446744073709551615
           }
         ]
       }
@@ -493,10 +632,24 @@
             }
           },
           {
-            "name": "policyVersion",
+            "name": "evaluationVersion",
             "type": {
               "type-name": "Uint",
               "maxval": 65535
+            }
+          },
+          {
+            "name": "profileAsOf",
+            "type": {
+              "type-name": "Uint",
+              "maxval": 18446744073709551615
+            }
+          },
+          {
+            "name": "validUntil",
+            "type": {
+              "type-name": "Uint",
+              "maxval": 18446744073709551615
             }
           }
         ]

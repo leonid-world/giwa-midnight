@@ -22,6 +22,7 @@ export function getInitialPrivateState(
     overdueCount: 0n,
     attestationSignature: { announcement: { x: 0n, y: 0n }, response: 0n },
     attestationProviderId: 0n,
+    attestationProfileAsOf: 0n,
     companySecretKey,
   };
 }

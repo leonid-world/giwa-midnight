@@ -16,6 +16,7 @@ import {
 import {
   Contract,
   type GiwaReceivableSubject,
+  type FunderPolicyRequest,
   type Ledger,
   ledger,
   pureCircuits,
@@ -27,6 +28,7 @@ import {
   GIWA_CHAIN_ID,
   RECEIVABLE_FINANCE_ADDRESS,
   createGiwaReceivableSubject,
+  DEFAULT_POLICY_REQUEST,
   createSignedFinancialProfileFromFixture,
   generateCompanySecret,
   generateProviderKeyPair,
@@ -47,7 +49,7 @@ export class GasokEligibilitySimulator {
   readonly midnightContractAddressBytes: Uint8Array;
   readonly defaultSubject: GiwaReceivableSubject;
 
-  constructor() {
+  constructor(blockTimeSeconds = 2_000_000_000) {
     const deployer = createEitherTestUser('GASOK deployer');
     this.contract = new Contract<GasokEligibilityPrivateState>(witnesses);
     this.midnightContractAddress = sampleContractAddress();
@@ -78,21 +80,32 @@ export class GasokEligibilitySimulator {
       currentZswapLocalState,
       currentContractState,
       currentPrivateState,
+      undefined,
+      undefined,
+      blockTimeSeconds,
     );
 
     this.registerProvider(this.providerId, this.providerPk);
   }
 
-  public deriveCompanyCommitment(companySecret: Uint8Array, pin: bigint): Uint8Array {
-    return pureCircuits.deriveCompanyCommitment(companySecret, pin);
+  public deriveCompanyCommitment(
+    companySecret: Uint8Array,
+    pin: bigint,
+    policyRequest: FunderPolicyRequest = DEFAULT_POLICY_REQUEST,
+  ): Uint8Array {
+    return pureCircuits.deriveCompanyCommitment(companySecret, pin, policyRequest.requestId);
   }
 
   public deriveAdminPublicKey(companySecret: Uint8Array): Uint8Array {
     return pureCircuits.deriveAdminPublicKey(companySecret);
   }
 
-  public computeCompanyCommitmentHash(companySecret: Uint8Array, pin: bigint): bigint {
-    return transientHash(bytes32Type, this.deriveCompanyCommitment(companySecret, pin));
+  public computeCompanyCommitmentHash(
+    companySecret: Uint8Array,
+    pin: bigint,
+    policyRequest: FunderPolicyRequest = DEFAULT_POLICY_REQUEST,
+  ): bigint {
+    return transientHash(bytes32Type, this.deriveCompanyCommitment(companySecret, pin, policyRequest));
   }
 
   public deriveGiwaReceivableBindingHash(
@@ -134,9 +147,11 @@ export class GasokEligibilitySimulator {
       giwaChainId?: bigint;
       receivableFinanceAddress?: Uint8Array;
       midnightContractAddressBytes?: Uint8Array;
+      policyRequest?: FunderPolicyRequest;
     } = {},
   ): Uint8Array {
-    const companyCommitment = this.deriveCompanyCommitment(companySecret, pin);
+    const policyRequest = options.policyRequest ?? DEFAULT_POLICY_REQUEST;
+    const companyCommitment = this.deriveCompanyCommitment(companySecret, pin, policyRequest);
     const bindingHash = this.deriveGiwaReceivableBindingHash(
       subject,
       options.giwaChainId,
@@ -144,7 +159,8 @@ export class GasokEligibilitySimulator {
     );
     const deploymentHash = this.deriveMidnightDeploymentHash(options.midnightContractAddressBytes);
 
-    return pureCircuits.deriveReceivableEligibilityKey(companyCommitment, bindingHash, deploymentHash);
+    const policyRequestHash = pureCircuits.derivePolicyRequestHash(policyRequest);
+    return pureCircuits.deriveReceivableEligibilityKey(companyCommitment, bindingHash, deploymentHash, policyRequestHash);
   }
 
   public createAttestationBinding(
@@ -156,17 +172,29 @@ export class GasokEligibilitySimulator {
       receivableFinanceAddress?: Uint8Array;
       midnightContractAddressBytes?: Uint8Array;
       providerId?: bigint;
+      policyRequest?: FunderPolicyRequest;
     } = {},
   ): FinancialAttestationBinding {
     return {
-      companyCommitmentHash: this.computeCompanyCommitmentHash(companySecret, pin),
+      companyCommitmentHash: this.computeCompanyCommitmentHash(
+        companySecret,
+        pin,
+        options.policyRequest ?? DEFAULT_POLICY_REQUEST,
+      ),
       giwaReceivableBindingHash: this.computeGiwaReceivableBindingHash(
         subject,
         options.giwaChainId,
         options.receivableFinanceAddress,
       ),
       midnightDeploymentHash: this.computeMidnightDeploymentHash(options.midnightContractAddressBytes),
+      policyRequestHash: transientHash(
+        bytes32Type,
+        pureCircuits.derivePolicyRequestHash(options.policyRequest ?? DEFAULT_POLICY_REQUEST),
+      ),
       providerId: options.providerId ?? this.providerId,
+      evaluationVersion: 2n,
+      profileAsOf: 1n,
+      validUntil: (options.policyRequest ?? DEFAULT_POLICY_REQUEST).validUntil,
     };
   }
 
@@ -199,11 +227,16 @@ export class GasokEligibilitySimulator {
     };
   }
 
-  public verifyEligibility(secretPin: bigint, subject: GiwaReceivableSubject = this.defaultSubject): Ledger {
+  public verifyEligibility(
+    secretPin: bigint,
+    subject: GiwaReceivableSubject = this.defaultSubject,
+    policyRequest: FunderPolicyRequest = DEFAULT_POLICY_REQUEST,
+  ): Ledger {
     this.circuitContext = this.contract.impureCircuits.verifyEligibility(
       this.circuitContext,
       secretPin,
       subject,
+      policyRequest,
     ).context;
     return ledger(this.circuitContext.currentQueryContext.state);
   }

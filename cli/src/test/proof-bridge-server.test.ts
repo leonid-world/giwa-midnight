@@ -5,45 +5,85 @@ import * as http from 'node:http';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { AuthorizationChallenge } from '../authorization.js';
 import type { ProofBridgeController } from '../proof-bridge/runtime.js';
-import { createProofBridgeServer } from '../proof-bridge/server.js';
+import { createProofBridgeServer, parseChallengeRequest } from '../proof-bridge/server.js';
+import {
+  LocalAttestationApiError,
+  type LocalAttestationErrorCode,
+} from '../attestation-errors.js';
+import { CapabilityOutboxError } from '../proof-bridge/capability-outbox.js';
+import type { ProofCapability } from '../api.js';
 
 const SESSION_ID = `0x${'1'.repeat(64)}`;
 const challenge = {
-  version: 1,
-  domain: { name: 'GASOK Mock Attestation', version: '1', chainId: '91342' },
+  version: 2,
+  domain: { name: 'GASOK Mock Attestation', version: '2', chainId: '91342' },
   primaryType: 'GASOKRoleAttestationAuthorization',
   types: { GASOKRoleAttestationAuthorization: [] },
   message: {
-    purpose: 'Authorize GASOK local mock financial attestation',
+    purpose: 'Authorize GASOK local mock financial attestation for a Funder policy request',
     authorizationId: `0x${'2'.repeat(64)}`,
     midnightContractAddress: `0x${'3'.repeat(64)}`,
     receivableFinanceAddress: `0x${'4'.repeat(40)}`,
     onchainReceivableId: '1',
     subjectRole: 'SELLER',
     partyWallet: `0x${'5'.repeat(40)}`,
+    requestId: `0x${'9'.repeat(64)}`,
+    intendedFunderWallet: `0x${'a'.repeat(40)}`,
+    minAnnualRevenueKrw: '500000000',
+    maxDebtRatioBps: '20000',
+    maxOverdueCount: '1',
     attestationRequestCommitment: `0x${'6'.repeat(64)}`,
     providerId: '2',
-    policyVersion: '1',
+    evaluationVersion: '2',
+    profileAsOf: '1000',
+    policyValidUntil: '4000000000',
     issuedAt: '1000',
     expiresAt: '1002',
   },
-} as AuthorizationChallenge;
+} as unknown as AuthorizationChallenge;
 
 const challengeBody = {
-  version: 1,
+  version: 2,
   onchainReceivableId: '1',
   subjectRole: 'SELLER',
   annualRevenueKrw: '500000000',
   debtRatioBps: '20000',
   overdueCount: '1',
-  secretPin: '1234',
+  policyRequest: {
+    requestId: `0x${'9'.repeat(64)}`,
+    intendedFunderWallet: `0x${'a'.repeat(40)}`,
+    minAnnualRevenueKrw: '500000000',
+    maxDebtRatioBps: '20000',
+    maxOverdueCount: '1',
+    validUntil: '4000000000',
+  },
 };
 const authorization = {
-  version: 1,
+  version: 2,
   authorizationId: challenge.message.authorizationId,
   typedDataHash: `0x${'7'.repeat(64)}`,
   signer: challenge.message.partyWallet,
   signature: `0x${'8'.repeat(130)}`,
+};
+const proofCapability: ProofCapability = {
+  version: 2,
+  evaluationVersion: 2,
+  midnightContractAddress: '3'.repeat(64),
+  companyCommitment: `0x${'b'.repeat(64)}`,
+  lookupKey: `0x${'c'.repeat(64)}`,
+  giwaChainId: '91342',
+  receivableFinanceAddress: challenge.message.receivableFinanceAddress,
+  onchainReceivableId: '1',
+  subjectRole: 'SELLER',
+  partyWallet: challenge.message.partyWallet,
+  requestId: challenge.message.requestId,
+  intendedFunderWallet: challenge.message.intendedFunderWallet,
+  minAnnualRevenueKrw: challenge.message.minAnnualRevenueKrw,
+  maxDebtRatioBps: challenge.message.maxDebtRatioBps,
+  maxOverdueCount: challenge.message.maxOverdueCount,
+  policyRequestHash: `0x${'d'.repeat(64)}`,
+  profileAsOf: '1000',
+  validUntil: challenge.message.policyValidUntil,
 };
 
 const servers: http.Server[] = [];
@@ -67,20 +107,24 @@ afterEach(async () => {
 async function startServer(controllerOverrides: Partial<ProofBridgeController> = {}) {
   const controller: ProofBridgeController = {
     createChallenge: vi.fn(async () => ({
-      version: 1 as const,
+      version: 2 as const,
       sessionId: SESSION_ID,
       expiresAt: '1002',
       authorizationRequest: challenge,
     })),
-    startProof: vi.fn(() => ({ version: 1 as const, sessionId: SESSION_ID, status: 'attesting' as const })),
+    startProof: vi.fn(async () => ({ version: 2 as const, sessionId: SESSION_ID, status: 'attesting' as const })),
     getStatus: vi.fn(() => ({
-      version: 1 as const,
+      version: 2 as const,
       sessionId: SESSION_ID,
       status: 'awaiting_authorization' as const,
     })),
-    cancel: vi.fn(() => ({ version: 1 as const, sessionId: SESSION_ID, status: 'cancelled' as const })),
+    cancel: vi.fn(async () => ({ version: 2 as const, sessionId: SESSION_ID, status: 'cancelled' as const })),
+    recover: vi.fn(() => {
+      throw new Error('not configured');
+    }),
+    acknowledge: vi.fn(async () => ({ version: 2 as const, sessionId: SESSION_ID, status: 'acknowledged' as const })),
     ...controllerOverrides,
-  };
+  } as ProofBridgeController;
   const allowedHosts = new Set<string>();
   const server = createProofBridgeServer({
     controller,
@@ -117,7 +161,7 @@ function protectedHeaders(): Record<string, string> {
 describe('Proof Bridge HTTP boundary', () => {
   it('accepts an exact challenge request and returns no-store security headers without CORS', async () => {
     const { controller, origin } = await startServer();
-    const response = await fetch(`${origin}/v1/proof-sessions/challenge`, {
+    const response = await fetch(`${origin}/v2/proof-sessions/challenge`, {
       method: 'POST',
       headers: protectedHeaders(),
       body: JSON.stringify(challengeBody),
@@ -130,7 +174,7 @@ describe('Proof Bridge HTTP boundary', () => {
     expect(response.headers.get('referrer-policy')).toBe('no-referrer');
     expect(response.headers.get('access-control-allow-origin')).toBeNull();
     expect(await response.json()).toEqual({
-      version: 1,
+      version: 2,
       sessionId: SESSION_ID,
       expiresAt: '1002',
       authorizationRequest: challenge,
@@ -141,8 +185,44 @@ describe('Proof Bridge HTTP boundary', () => {
       annualRevenueKrw: 500_000_000n,
       debtRatioBps: 20_000n,
       overdueCount: 1n,
-      secretPin: 1234n,
+      policyRequest: {
+        requestId: `0x${'9'.repeat(64)}`,
+        intendedFunderWallet: `0x${'a'.repeat(40)}`,
+        minAnnualRevenueKrw: 500000000n,
+        maxDebtRatioBps: 20000n,
+        maxOverdueCount: 1n,
+        validUntil: 4000000000n,
+      },
     });
+  });
+
+  it.each([
+    ['request ID', { requestId: `0x${'8'.repeat(64)}` }],
+    ['Funder audience', { intendedFunderWallet: `0x${'b'.repeat(40)}` }],
+    ['minimum revenue', { minAnnualRevenueKrw: '500000001' }],
+    ['maximum debt ratio', { maxDebtRatioBps: '19999' }],
+    ['maximum overdue count', { maxOverdueCount: '0' }],
+    ['valid-until', { validUntil: '4000000001' }],
+  ])('parses the request-bound policy %s instead of substituting a local default', (_label, override) => {
+    const parsed = parseChallengeRequest({
+      ...challengeBody,
+      policyRequest: { ...challengeBody.policyRequest, ...override },
+    }, 1_000n);
+    expect({
+      requestId: parsed.policyRequest.requestId,
+      intendedFunderWallet: parsed.policyRequest.intendedFunderWallet,
+      minAnnualRevenueKrw: parsed.policyRequest.minAnnualRevenueKrw.toString(),
+      maxDebtRatioBps: parsed.policyRequest.maxDebtRatioBps.toString(),
+      maxOverdueCount: parsed.policyRequest.maxOverdueCount.toString(),
+      validUntil: parsed.policyRequest.validUntil.toString(),
+    }).toEqual({ ...challengeBody.policyRequest, ...override });
+  });
+
+  it('rejects a policy at its exact valid-until boundary', () => {
+    expect(() => parseChallengeRequest({
+      ...challengeBody,
+      policyRequest: { ...challengeBody.policyRequest, validUntil: '1000' },
+    }, 1_000n)).toThrow(expect.objectContaining({ code: 'INVALID_REQUEST' }));
   });
 
   it.each([
@@ -153,7 +233,7 @@ describe('Proof Bridge HTTP boundary', () => {
     ['compressed body', { ...protectedHeaders(), 'Content-Encoding': 'gzip' }, 415],
   ])('rejects %s', async (_label, headers, expectedStatus) => {
     const { origin } = await startServer();
-    const response = await fetch(`${origin}/v1/proof-sessions/challenge`, {
+    const response = await fetch(`${origin}/v2/proof-sessions/challenge`, {
       method: 'POST',
       headers,
       body: JSON.stringify(challengeBody),
@@ -163,7 +243,7 @@ describe('Proof Bridge HTTP boundary', () => {
 
   it('rejects a forged Host header', async () => {
     const { origin } = await startServer();
-    const endpoint = new URL('/v1/proof-sessions/challenge', origin);
+    const endpoint = new URL('/v2/proof-sessions/challenge', origin);
     const body = JSON.stringify(challengeBody);
     const status = await new Promise<number>((resolve, reject) => {
       const request = http.request(
@@ -191,32 +271,51 @@ describe('Proof Bridge HTTP boundary', () => {
 
   it('rejects extra fields, query strings, wrong methods, and oversized bodies', async () => {
     const { origin } = await startServer();
-    const extra = await fetch(`${origin}/v1/proof-sessions/challenge`, {
+    const extra = await fetch(`${origin}/v2/proof-sessions/challenge`, {
       method: 'POST',
       headers: protectedHeaders(),
       body: JSON.stringify({ ...challengeBody, unexpected: true }),
     });
     expect(extra.status).toBe(400);
 
-    const query = await fetch(`${origin}/v1/proof-sessions/status?sessionId=${SESSION_ID}`, {
+    const browserPin = await fetch(`${origin}/v2/proof-sessions/challenge`, {
       method: 'POST',
       headers: protectedHeaders(),
-      body: JSON.stringify({ version: 1, sessionId: SESSION_ID }),
+      body: JSON.stringify({ ...challengeBody, secretPin: '1234' }),
+    });
+    expect(browserPin.status).toBe(400);
+
+    const query = await fetch(`${origin}/v2/proof-sessions/status?sessionId=${SESSION_ID}`, {
+      method: 'POST',
+      headers: protectedHeaders(),
+      body: JSON.stringify({ version: 2, sessionId: SESSION_ID }),
     });
     expect(query.status).toBe(404);
 
-    const method = await fetch(`${origin}/v1/proof-sessions/status`, {
+    const method = await fetch(`${origin}/v2/proof-sessions/status`, {
       method: 'GET',
       headers: protectedHeaders(),
     });
     expect(method.status).toBe(405);
 
-    const oversized = await fetch(`${origin}/v1/proof-sessions/challenge`, {
+    const oversized = await fetch(`${origin}/v2/proof-sessions/challenge`, {
       method: 'POST',
       headers: protectedHeaders(),
       body: JSON.stringify({ data: 'x'.repeat(4_096) }),
     });
     expect(oversized.status).toBe(413);
+  });
+
+  it('does not expose a legacy v1 proof-session fallback', async () => {
+    const { controller, origin } = await startServer();
+    const response = await fetch(`${origin}/v1/proof-sessions/challenge`, {
+      method: 'POST',
+      headers: protectedHeaders(),
+      body: JSON.stringify({ ...challengeBody, version: 1 }),
+    });
+
+    expect(response.status).toBe(404);
+    expect(controller.createChallenge).not.toHaveBeenCalled();
   });
 
   it('does not reflect controller errors that may contain financial values', async () => {
@@ -225,7 +324,7 @@ describe('Proof Bridge HTTP boundary', () => {
         throw new Error('annualRevenueKrw=500000000 secretPin=1234');
       },
     });
-    const response = await fetch(`${origin}/v1/proof-sessions/challenge`, {
+    const response = await fetch(`${origin}/v2/proof-sessions/challenge`, {
       method: 'POST',
       headers: protectedHeaders(),
       body: JSON.stringify(challengeBody),
@@ -238,57 +337,159 @@ describe('Proof Bridge HTTP boundary', () => {
     expect(text).not.toContain('1234');
   });
 
+  it.each([
+    [404, 'GIWA_RECEIVABLE_NOT_FOUND'],
+    [502, 'GIWA_RPC_UNAVAILABLE'],
+    [409, 'POLICY_REQUEST_EXPIRED'],
+    [403, 'ROLE_WALLET_MISMATCH'],
+  ] as const)(
+    'preserves the safe typed Provider HTTP %i %s error',
+    async (status, code: LocalAttestationErrorCode) => {
+      const typedError = new LocalAttestationApiError(code);
+      const { origin } = await startServer({
+        createChallenge: async () => {
+          throw typedError;
+        },
+      });
+      const response = await fetch(`${origin}/v2/proof-sessions/challenge`, {
+        method: 'POST',
+        headers: protectedHeaders(),
+        body: JSON.stringify(challengeBody),
+      });
+
+      expect(response.status).toBe(status);
+      expect(await response.json()).toEqual({
+        error: { code, message: typedError.publicMessage },
+      });
+    },
+  );
+
   it('accepts only exact prove, status, and cancel schemas', async () => {
     const { controller, origin } = await startServer();
-    const prove = await fetch(`${origin}/v1/proof-sessions/prove`, {
+    const prove = await fetch(`${origin}/v2/proof-sessions/prove`, {
       method: 'POST',
       headers: protectedHeaders(),
-      body: JSON.stringify({ version: 1, sessionId: SESSION_ID, authorization }),
+      body: JSON.stringify({ version: 2, sessionId: SESSION_ID, authorization }),
     });
     expect(prove.status).toBe(202);
-    expect(await prove.json()).toEqual({ version: 1, sessionId: SESSION_ID, status: 'attesting' });
+    expect(await prove.json()).toEqual({ version: 2, sessionId: SESSION_ID, status: 'attesting' });
     expect(controller.startProof).toHaveBeenCalledWith(SESSION_ID, authorization);
 
-    const status = await fetch(`${origin}/v1/proof-sessions/status`, {
+    const status = await fetch(`${origin}/v2/proof-sessions/status`, {
       method: 'POST',
       headers: protectedHeaders(),
-      body: JSON.stringify({ version: 1, sessionId: SESSION_ID }),
+      body: JSON.stringify({ version: 2, sessionId: SESSION_ID }),
     });
     expect(status.status).toBe(200);
     expect(controller.getStatus).toHaveBeenCalledWith(SESSION_ID);
 
-    const cancel = await fetch(`${origin}/v1/proof-sessions/cancel`, {
+    const cancel = await fetch(`${origin}/v2/proof-sessions/cancel`, {
       method: 'POST',
       headers: protectedHeaders(),
-      body: JSON.stringify({ version: 1, sessionId: SESSION_ID }),
+      body: JSON.stringify({ version: 2, sessionId: SESSION_ID }),
     });
     expect(cancel.status).toBe(200);
-    expect(await cancel.json()).toEqual({ version: 1, sessionId: SESSION_ID, status: 'cancelled' });
+    expect(await cancel.json()).toEqual({ version: 2, sessionId: SESSION_ID, status: 'cancelled' });
     expect(controller.cancel).toHaveBeenCalledWith(SESSION_ID);
 
-    const malformedSession = await fetch(`${origin}/v1/proof-sessions/status`, {
+    const malformedSession = await fetch(`${origin}/v2/proof-sessions/status`, {
       method: 'POST',
       headers: protectedHeaders(),
-      body: JSON.stringify({ version: 1, sessionId: `0x${'A'.repeat(64)}` }),
+      body: JSON.stringify({ version: 2, sessionId: `0x${'A'.repeat(64)}` }),
     });
     expect(malformedSession.status).toBe(400);
 
-    const extraAuthorizationKey = await fetch(`${origin}/v1/proof-sessions/prove`, {
+    const extraAuthorizationKey = await fetch(`${origin}/v2/proof-sessions/prove`, {
       method: 'POST',
       headers: protectedHeaders(),
       body: JSON.stringify({
-        version: 1,
+        version: 2,
         sessionId: SESSION_ID,
         authorization: { ...authorization, privateKey: 'must-never-be-accepted' },
       }),
     });
     expect(extraAuthorizationKey.status).toBe(400);
 
-    const extraSessionKey = await fetch(`${origin}/v1/proof-sessions/cancel`, {
+    const extraSessionKey = await fetch(`${origin}/v2/proof-sessions/cancel`, {
       method: 'POST',
       headers: protectedHeaders(),
-      body: JSON.stringify({ version: 1, sessionId: SESSION_ID, retry: true }),
+      body: JSON.stringify({ version: 2, sessionId: SESSION_ID, retry: true }),
     });
     expect(extraSessionKey.status).toBe(400);
+  });
+
+  it('recovers and acknowledges only exact body-bound durable proof results', async () => {
+    const recover = vi.fn(() => ({
+      version: 2 as const,
+      sessionId: SESSION_ID,
+      status: 'complete' as const,
+      proofCapability,
+    }));
+    const acknowledge = vi.fn(async () => ({
+      version: 2 as const,
+      sessionId: SESSION_ID,
+      status: 'acknowledged' as const,
+    }));
+    const { origin } = await startServer({ recover, acknowledge });
+
+    const recovered = await fetch(`${origin}/v2/proof-sessions/recover`, {
+      method: 'POST',
+      headers: protectedHeaders(),
+      body: JSON.stringify({ version: 2, requestId: challenge.message.requestId }),
+    });
+    expect(recovered.status).toBe(200);
+    expect(await recovered.json()).toEqual({
+      version: 2,
+      sessionId: SESSION_ID,
+      status: 'complete',
+      proofCapability,
+    });
+    expect(recover).toHaveBeenCalledWith(challenge.message.requestId);
+
+    const acknowledged = await fetch(`${origin}/v2/proof-sessions/ack`, {
+      method: 'POST',
+      headers: protectedHeaders(),
+      body: JSON.stringify({
+        version: 2,
+        sessionId: SESSION_ID,
+        requestId: challenge.message.requestId,
+      }),
+    });
+    expect(acknowledged.status).toBe(200);
+    expect(await acknowledged.json()).toEqual({
+      version: 2,
+      sessionId: SESSION_ID,
+      status: 'acknowledged',
+    });
+    expect(acknowledge).toHaveBeenCalledWith(SESSION_ID, challenge.message.requestId);
+
+    const extraKey = await fetch(`${origin}/v2/proof-sessions/recover`, {
+      method: 'POST',
+      headers: protectedHeaders(),
+      body: JSON.stringify({ version: 2, requestId: challenge.message.requestId, capability: {} }),
+    });
+    expect(extraKey.status).toBe(400);
+    expect(recover).toHaveBeenCalledTimes(1);
+  });
+
+  it('maps durable outbox misses and indeterminate reservations without reflecting request values', async () => {
+    const { origin } = await startServer({
+      recover: () => {
+        throw new CapabilityOutboxError(
+          'PROOF_RESULT_IN_PROGRESS',
+          'A proof attempt for this request is already reserved or may have been submitted. Do not prove it again.',
+        );
+      },
+    });
+    const response = await fetch(`${origin}/v2/proof-sessions/recover`, {
+      method: 'POST',
+      headers: protectedHeaders(),
+      body: JSON.stringify({ version: 2, requestId: challenge.message.requestId }),
+    });
+    const text = await response.text();
+
+    expect(response.status).toBe(409);
+    expect(text).toContain('PROOF_RESULT_IN_PROGRESS');
+    expect(text).not.toContain(challenge.message.requestId);
   });
 });

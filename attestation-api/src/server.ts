@@ -1,13 +1,21 @@
 import restify from 'restify';
 import type { Server as NodeHttpServer } from 'node:http';
-import { MAX_FIELD, type JubjubPoint } from '@midnight-ntwrk/midnight-js-protocol/compact-runtime';
+import {
+  CompactTypeBytes,
+  MAX_FIELD,
+  transientHash,
+  type JubjubPoint,
+} from '@midnight-ntwrk/midnight-js-protocol/compact-runtime';
+import { GasokEligibility } from 'zkloan-credit-scorer-contract';
 import {
   AUTHORIZATION_PROTOCOL,
+  EVALUATION_VERSION,
   AuthorizationCapacityError,
   AuthorizationChallengeStore,
   AuthorizationGenerationError,
   AuthorizationValidationError,
-  POLICY_VERSION,
+  PolicyRequestExpiredError,
+  RoleWalletMismatchError,
   PROVIDER_ID,
   buildAttestationRequestCommitment,
   buildAuthorizationChallengeResponse,
@@ -45,6 +53,8 @@ const UINT16_MAX = (1n << 16n) - 1n;
 const UINT32_MAX = (1n << 32n) - 1n;
 const UINT64_MAX = (1n << 64n) - 1n;
 const UINT256_MAX = (1n << 256n) - 1n;
+const bytes32Type = new CompactTypeBytes(32);
+const { pureCircuits } = GasokEligibility;
 const AUTHORIZATION_CHALLENGE_PATH = '/authorization-challenges';
 const ATTESTATION_PATH = '/attest';
 const AUTHORIZATION_SALT_PATTERN = /^0x[0-9a-fA-F]{64}$/;
@@ -63,8 +73,17 @@ const CHALLENGE_REQUEST_KEYS = [
   'midnightContractAddress',
   'onchainReceivableId',
   'overdueCount',
+  'policyRequest',
   'subjectRole',
   'version',
+] as const;
+const POLICY_REQUEST_KEYS = [
+  'intendedFunderWallet',
+  'maxDebtRatioBps',
+  'maxOverdueCount',
+  'minAnnualRevenueKrw',
+  'requestId',
+  'validUntil',
 ] as const;
 const ATTESTATION_REQUEST_KEYS = [...CHALLENGE_REQUEST_KEYS, 'authorization'].sort();
 const AUTHORIZATION_PROOF_KEYS = [
@@ -143,7 +162,7 @@ function parseRequest(
   body: JsonRecord,
   approvedMidnightContractAddress: string,
 ): ParsedAttestationRequest {
-  if (body.version !== 1) {
+  if (body.version !== 2) {
     throw invalidRequest();
   }
   const annualRevenueKrw = parseDecimalString(body.annualRevenueKrw, UINT64_MAX);
@@ -155,6 +174,26 @@ function parseRequest(
     throw invalidRequest();
   }
   const subjectRole = parseSubjectRole(body.subjectRole);
+  const policy = requireExactRecord(body.policyRequest, POLICY_REQUEST_KEYS);
+  if (
+    typeof policy.requestId !== 'string' ||
+    !AUTHORIZATION_ID_PATTERN.test(policy.requestId) ||
+    policy.requestId !== policy.requestId.toLowerCase() ||
+    policy.requestId === ZERO_BYTES32 ||
+    typeof policy.intendedFunderWallet !== 'string' ||
+    !EVM_ADDRESS_PATTERN.test(policy.intendedFunderWallet) ||
+    policy.intendedFunderWallet !== policy.intendedFunderWallet.toLowerCase() ||
+    policy.intendedFunderWallet === ZERO_ADDRESS
+  ) {
+    throw invalidRequest();
+  }
+  const minAnnualRevenueKrw = parseDecimalString(policy.minAnnualRevenueKrw, UINT64_MAX);
+  const maxDebtRatioBps = parseDecimalString(policy.maxDebtRatioBps, UINT32_MAX);
+  const maxOverdueCount = parseDecimalString(policy.maxOverdueCount, UINT16_MAX);
+  const validUntil = parseDecimalString(policy.validUntil, UINT64_MAX);
+  if (validUntil === 0n) {
+    throw invalidRequest();
+  }
   if (
     typeof body.authorizationSalt !== 'string' ||
     !AUTHORIZATION_SALT_PATTERN.test(body.authorizationSalt) ||
@@ -186,6 +225,14 @@ function parseRequest(
     midnightContractAddress,
     onchainReceivableId,
     subjectRole,
+    policyRequest: Object.freeze({
+      requestId: policy.requestId,
+      intendedFunderWallet: policy.intendedFunderWallet,
+      minAnnualRevenueKrw,
+      maxDebtRatioBps,
+      maxOverdueCount,
+      validUntil,
+    }),
   });
 }
 
@@ -200,7 +247,7 @@ function locateAuthorizationId(value: unknown): string {
 function parseAuthorizationProof(value: unknown): AuthorizationProof {
   const proof = requireExactRecord(value, AUTHORIZATION_PROOF_KEYS);
   if (
-    proof.version !== 1 ||
+    proof.version !== 2 ||
     typeof proof.authorizationId !== 'string' || !AUTHORIZATION_ID_PATTERN.test(proof.authorizationId) ||
     typeof proof.typedDataHash !== 'string' || !TYPED_DATA_HASH_PATTERN.test(proof.typedDataHash) ||
     typeof proof.signer !== 'string' || !EVM_ADDRESS_PATTERN.test(proof.signer) ||
@@ -210,7 +257,7 @@ function parseAuthorizationProof(value: unknown): AuthorizationProof {
     throw new AuthorizationValidationError();
   }
   return {
-    version: 1,
+    version: 2,
     authorizationId: proof.authorizationId.toLowerCase(),
     typedDataHash: proof.typedDataHash.toLowerCase(),
     signer: proof.signer.toLowerCase(),
@@ -237,6 +284,20 @@ function sendError(response: restify.Response, error: PublicApiError): void {
 function mapError(error: unknown): PublicApiError {
   if (error instanceof PublicApiError) {
     return error;
+  }
+  if (error instanceof RoleWalletMismatchError) {
+    return new PublicApiError(
+      403,
+      'ROLE_WALLET_MISMATCH',
+      'The wallet authorization does not match the current GIWA role wallet.',
+    );
+  }
+  if (error instanceof PolicyRequestExpiredError) {
+    return new PublicApiError(
+      409,
+      'POLICY_REQUEST_EXPIRED',
+      'The Funder policy request has expired.',
+    );
   }
   if (error instanceof AuthorizationValidationError) {
     return new PublicApiError(
@@ -387,7 +448,14 @@ export function createServer(
       const body = requireExactRecord(untrustedBody, ATTESTATION_REQUEST_KEYS) as unknown as AttestationRequest;
       const proof = parseAuthorizationProof(body.authorization);
       const parsed = parseRequest(body as unknown as JsonRecord, approvedMidnightContractAddress);
-      const requestCommitment = buildAttestationRequestCommitment(parsed, challenge.message.partyWallet);
+      if (parsed.policyRequest.validUntil <= authorizationStore.currentUnixSeconds()) {
+        throw new PolicyRequestExpiredError();
+      }
+      const requestCommitment = buildAttestationRequestCommitment(
+        parsed,
+        challenge.message.partyWallet,
+        challenge.message.profileAsOf,
+      );
       if (
         challenge.message.authorizationId !== proof.authorizationId ||
         challenge.message.midnightContractAddress !== `0x${parsed.midnightContractAddress}` ||
@@ -395,7 +463,13 @@ export function createServer(
         challenge.message.onchainReceivableId !== parsed.onchainReceivableId.toString() ||
         challenge.message.subjectRole !== parsed.subjectRole ||
         challenge.message.providerId !== PROVIDER_ID.toString() ||
-        challenge.message.policyVersion !== POLICY_VERSION.toString() ||
+        challenge.message.requestId !== parsed.policyRequest.requestId ||
+        challenge.message.intendedFunderWallet !== parsed.policyRequest.intendedFunderWallet ||
+        challenge.message.minAnnualRevenueKrw !== parsed.policyRequest.minAnnualRevenueKrw.toString() ||
+        challenge.message.maxDebtRatioBps !== parsed.policyRequest.maxDebtRatioBps.toString() ||
+        challenge.message.maxOverdueCount !== parsed.policyRequest.maxOverdueCount.toString() ||
+        challenge.message.evaluationVersion !== EVALUATION_VERSION.toString() ||
+        challenge.message.policyValidUntil !== parsed.policyRequest.validUntil.toString() ||
         challenge.message.attestationRequestCommitment !== requestCommitment
       ) {
         throw new AuthorizationValidationError();
@@ -419,11 +493,24 @@ export function createServer(
         challenge.message.issuedAt,
         challenge.message.expiresAt,
       );
+      // Verify the exact immutable challenge first. This distinguishes a valid,
+      // recoverable signature made by a non-canonical role wallet from malformed
+      // authorization material without accepting a stale GIWA role binding.
+      verifyAuthorizationSignature(challenge.message, proof, context.partyWallet);
       if (!sameAuthorizationMessage(expectedMessage, challenge.message)) {
         throw new AuthorizationValidationError();
       }
-      verifyAuthorizationSignature(expectedMessage, proof, context.partyWallet);
 
+      const policyRequestHashBytes = pureCircuits.derivePolicyRequestHash({
+        requestId: Uint8Array.from(Buffer.from(parsed.policyRequest.requestId.slice(2), 'hex')),
+        intendedFunderWallet: Uint8Array.from(Buffer.from(parsed.policyRequest.intendedFunderWallet.slice(2), 'hex')),
+        minAnnualRevenueKrw: parsed.policyRequest.minAnnualRevenueKrw,
+        maxDebtRatioBps: parsed.policyRequest.maxDebtRatioBps,
+        maxOverdueCount: parsed.policyRequest.maxOverdueCount,
+        validUntil: parsed.policyRequest.validUntil,
+      });
+      const policyRequestHash = `0x${Buffer.from(policyRequestHashBytes).toString('hex')}`;
+      const policyRequestHashField = transientHash(bytes32Type, policyRequestHashBytes);
       const signature = signFinancialData(
         providerSk,
         parsed.annualRevenueKrw,
@@ -432,8 +519,11 @@ export function createServer(
         parsed.companyCommitmentHash,
         context.bindingHashField,
         context.deploymentHashField,
+        policyRequestHashField,
         BigInt(PROVIDER_ID),
-        BigInt(POLICY_VERSION),
+        BigInt(EVALUATION_VERSION),
+        BigInt(challenge.message.profileAsOf),
+        parsed.policyRequest.validUntil,
       );
 
       const response: AttestationResponse = {
@@ -445,7 +535,10 @@ export function createServer(
           response: signature.response.toString(),
         },
         providerId: PROVIDER_ID,
-        policyVersion: POLICY_VERSION,
+        evaluationVersion: EVALUATION_VERSION,
+        policyRequestHash,
+        profileAsOf: challenge.message.profileAsOf,
+        validUntil: parsed.policyRequest.validUntil.toString(),
         midnightContractAddress: context.midnightContractAddress,
         binding: {
           giwaChainId: GIWA_CHAIN_ID.toString(),

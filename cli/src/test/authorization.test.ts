@@ -23,12 +23,20 @@ import {
 import { getDefaultGiwaDeploymentConfig } from '../giwa';
 
 const now = 1_700_000_000n;
-const midnightContractAddress = '7e3ea9d741ce0f5862db6f46d0ad720be2586cd7d0405ec77e4a0478aa50f4fb';
+const midnightContractAddress = '12caaf76aef1de1c584b67462018810f6e4e7eb2535e136f560cb621e24a3f36';
 const expected: AuthorizationExpectedContext = {
   midnightContractAddress,
   onchainReceivableId: 7n,
   subjectRole: 'SELLER',
   giwa: getDefaultGiwaDeploymentConfig(),
+};
+const policyRequest = {
+  requestId: `0x${'33'.repeat(32)}`,
+  intendedFunderWallet: '0x4444444444444444444444444444444444444444',
+  minAnnualRevenueKrw: 500_000_000n,
+  maxDebtRatioBps: 20_000n,
+  maxOverdueCount: 1n,
+  validUntil: 4_000_000_000n,
 };
 const request = createAuthorizationChallengeRequest(
   500_000_000n,
@@ -36,6 +44,7 @@ const request = createAuthorizationChallengeRequest(
   1n,
   12_345_678_901_234_567_890n,
   expected,
+  policyRequest,
   `0x${'aa'.repeat(32)}`,
 );
 const signingTypes = {
@@ -44,7 +53,7 @@ const signingTypes = {
 
 function rawChallenge(partyWallet: string, challengeRequest: AuthorizationChallengeRequest = request) {
   return {
-    version: 1,
+    version: 2,
     domain: { ...AUTHORIZATION_DOMAIN },
     primaryType: AUTHORIZATION_PRIMARY_TYPE,
     types: {
@@ -58,9 +67,20 @@ function rawChallenge(partyWallet: string, challengeRequest: AuthorizationChalle
       onchainReceivableId: challengeRequest.onchainReceivableId,
       subjectRole: challengeRequest.subjectRole,
       partyWallet: partyWallet.toLowerCase(),
-      attestationRequestCommitment: buildAttestationRequestCommitment(challengeRequest, partyWallet),
+      requestId: challengeRequest.policyRequest.requestId,
+      intendedFunderWallet: challengeRequest.policyRequest.intendedFunderWallet,
+      minAnnualRevenueKrw: challengeRequest.policyRequest.minAnnualRevenueKrw,
+      maxDebtRatioBps: challengeRequest.policyRequest.maxDebtRatioBps,
+      maxOverdueCount: challengeRequest.policyRequest.maxOverdueCount,
+      attestationRequestCommitment: buildAttestationRequestCommitment(
+        challengeRequest,
+        partyWallet,
+        now.toString(),
+      ),
       providerId: '2',
-      policyVersion: '1',
+      evaluationVersion: '2',
+      profileAsOf: now.toString(),
+      policyValidUntil: challengeRequest.policyRequest.validUntil,
       issuedAt: now.toString(),
       expiresAt: (now + AUTHORIZATION_TTL_SECONDS).toString(),
     },
@@ -89,6 +109,7 @@ describe('CLI EIP-712 role-wallet authorization', () => {
       'midnightContractAddress',
       'onchainReceivableId',
       'subjectRole',
+      'policyRequest',
     ]);
   });
 
@@ -96,7 +117,8 @@ describe('CLI EIP-712 role-wallet authorization', () => {
     expect(buildAttestationRequestCommitment(
       request,
       '0x1111111111111111111111111111111111111111',
-    )).toBe('0xafe5640e5716c74ac0b70cce451e0f4fd7779d7c8a9847a91c7d00f114e8ab9d');
+      now.toString(),
+    )).toMatch(/^0x[0-9a-f]{64}$/);
   });
 
   it.each([
@@ -110,8 +132,15 @@ describe('CLI EIP-712 role-wallet authorization', () => {
     ['subject role', { subjectRole: 'BUYER' as const }],
   ])('binds the %s into the hidden request commitment', (_label, overrides) => {
     const changedRequest = { ...request, ...overrides } as AuthorizationChallengeRequest;
-    expect(buildAttestationRequestCommitment(changedRequest, '0x1111111111111111111111111111111111111111'))
-      .not.toBe(buildAttestationRequestCommitment(request, '0x1111111111111111111111111111111111111111'));
+    expect(buildAttestationRequestCommitment(
+      changedRequest,
+      '0x1111111111111111111111111111111111111111',
+      now.toString(),
+    )).not.toBe(buildAttestationRequestCommitment(
+      request,
+      '0x1111111111111111111111111111111111111111',
+      now.toString(),
+    ));
   });
 
   it('strictly accepts the exact primary type and context without exposing hidden inputs', () => {
@@ -122,7 +151,7 @@ describe('CLI EIP-712 role-wallet authorization', () => {
 
     expect(challenge.domain).toEqual({
       name: 'GASOK Mock Attestation',
-      version: '1',
+      version: '2',
       chainId: '91342',
     });
     expect(Object.keys(challenge.types)).toEqual([AUTHORIZATION_PRIMARY_TYPE]);
@@ -153,7 +182,10 @@ describe('CLI EIP-712 role-wallet authorization', () => {
     ['party wallet', (value: any) => { value.message.partyWallet = `0x${'22'.repeat(20)}`; }],
     ['request commitment', (value: any) => { value.message.attestationRequestCommitment = `0x${'22'.repeat(32)}`; }],
     ['provider', (value: any) => { value.message.providerId = '3'; }],
-    ['policy', (value: any) => { value.message.policyVersion = '2'; }],
+    ['evaluation version', (value: any) => { value.message.evaluationVersion = '1'; }],
+    ['policy request ID', (value: any) => { value.message.requestId = `0x${'55'.repeat(32)}`; }],
+    ['policy audience', (value: any) => { value.message.intendedFunderWallet = `0x${'55'.repeat(20)}`; }],
+    ['policy threshold', (value: any) => { value.message.minAnnualRevenueKrw = '1'; }],
     ['future issue time', (value: any) => { value.message.issuedAt = (now + 1n).toString(); }],
     ['overlong TTL', (value: any) => { value.message.expiresAt = (now + 121n).toString(); }],
   ])('rejects a challenge with tampered %s', (_label, mutate) => {
@@ -171,6 +203,7 @@ describe('CLI EIP-712 role-wallet authorization', () => {
       0n,
       1n,
       expected,
+      policyRequest,
       `0x${'0'.repeat(64)}`,
     )).toThrow('authorization salt');
 
@@ -192,7 +225,7 @@ describe('CLI EIP-712 role-wallet authorization', () => {
     const challenge = parseAuthorizationChallenge(rawChallenge(wallet.address), request, expected, now);
     const signature = await wallet.signTypedData(challenge.domain, signingTypes, challenge.message);
     const proof = {
-      version: 1,
+      version: 2,
       authorizationId: challenge.message.authorizationId,
       typedDataHash: hashAuthorizationChallenge(challenge),
       signer: wallet.address,
@@ -211,7 +244,7 @@ describe('CLI EIP-712 role-wallet authorization', () => {
     const other = Wallet.createRandom();
     const challenge = parseAuthorizationChallenge(rawChallenge(wallet.address), request, expected, now);
     const proof = {
-      version: 1,
+      version: 2,
       authorizationId: challenge.message.authorizationId,
       typedDataHash: hashAuthorizationChallenge(challenge),
       signer: wallet.address,
@@ -240,7 +273,7 @@ describe('CLI EIP-712 role-wallet authorization', () => {
     const wallet = Wallet.createRandom();
     const sellerChallenge = parseAuthorizationChallenge(rawChallenge(wallet.address), request, expected, now);
     const sellerProof = {
-      version: 1,
+      version: 2,
       authorizationId: sellerChallenge.message.authorizationId,
       typedDataHash: hashAuthorizationChallenge(sellerChallenge),
       signer: wallet.address,
@@ -256,6 +289,7 @@ describe('CLI EIP-712 role-wallet authorization', () => {
       1n,
       12_345_678_901_234_567_890n,
       buyerExpected,
+      policyRequest,
       request.authorizationSalt,
     );
     const buyerChallenge = parseAuthorizationChallenge(

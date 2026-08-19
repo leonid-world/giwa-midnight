@@ -7,6 +7,7 @@ import * as api from '../api.js';
 import {
   PINNED_MIDNIGHT_CONTRACT_ADDRESS,
   fetchProviderInfo,
+  generatePseudonymNonce,
   parseProviderInfo,
   preflightContractAndProvider,
   requireExistingPinnedPrivateState,
@@ -25,7 +26,7 @@ const providerInfoJson = {
   publicKey: { x: '123', y: '456' },
   approvedMidnightContractAddress: PINNED_MIDNIGHT_CONTRACT_ADDRESS,
   attestationType: 'mock',
-  authorizationProtocol: 'eip712-role-wallet-v1',
+  authorizationProtocol: 'eip712-role-wallet-v2',
 };
 
 function ledger(overrides: Record<string, unknown> = {}) {
@@ -43,6 +44,10 @@ function ledger(overrides: Record<string, unknown> = {}) {
 }
 
 describe('local Proof Bridge preflight', () => {
+  it('derives the full Uint16 pseudonym nonce from two CSPRNG bytes', () => {
+    expect(generatePseudonymNonce(() => Buffer.from([0x12, 0x34]))).toBe(0x1234n);
+    expect(() => generatePseudonymNonce(() => Buffer.alloc(1))).toThrow('invalid value');
+  });
   it('strictly parses the pinned mock Provider 2 identity', () => {
     expect(parseProviderInfo(providerInfoJson)).toEqual({
       providerId: 2,

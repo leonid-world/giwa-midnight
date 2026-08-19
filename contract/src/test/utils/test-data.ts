@@ -5,6 +5,7 @@
 import { type GasokEligibilityPrivateState } from '../../witnesses.js';
 import {
   pureCircuits,
+  type FunderPolicyRequest,
   type GiwaReceivableSubject,
   type Schnorr_SchnorrSignature,
 } from '../../managed/zkloan-credit-scorer/contract/index.js';
@@ -18,7 +19,16 @@ export const SELLER_ROLE = 1n;
 export const BUYER_ROLE = 2n;
 export const SELLER_WALLET_HEX = '0x1111111111111111111111111111111111111111';
 export const BUYER_WALLET_HEX = '0x2222222222222222222222222222222222222222';
-export const POLICY_VERSION = 1n;
+export const EVALUATION_VERSION = 2n;
+export const PROFILE_AS_OF = 1n;
+export const DEFAULT_POLICY_REQUEST: FunderPolicyRequest = {
+  requestId: Uint8Array.from(Buffer.from('11'.repeat(32), 'hex')),
+  intendedFunderWallet: Uint8Array.from(Buffer.from('33'.repeat(20), 'hex')),
+  minAnnualRevenueKrw: 500000000n,
+  maxDebtRatioBps: 20000n,
+  maxOverdueCount: 1n,
+  validUntil: 4000000000n,
+};
 
 export function uint256ToBytes(value: bigint): Uint8Array {
   if (value < 0n || value > UINT256_MAX) {
@@ -65,16 +75,22 @@ export type FinancialAttestationMessage = [
   companyCommitmentHash: bigint,
   giwaReceivableBindingHash: bigint,
   midnightDeploymentHash: bigint,
+  policyRequestHash: bigint,
   providerId: bigint,
-  policyVersion: bigint,
+  evaluationVersion: bigint,
+  profileAsOf: bigint,
+  validUntil: bigint,
 ];
 
 export type FinancialAttestationBinding = {
   companyCommitmentHash: bigint;
   giwaReceivableBindingHash: bigint;
   midnightDeploymentHash: bigint;
+  policyRequestHash: bigint;
   providerId?: bigint;
-  policyVersion?: bigint;
+  evaluationVersion?: bigint;
+  profileAsOf?: bigint;
+  validUntil?: bigint;
 };
 
 export function buildFinancialAttestationMessage(
@@ -90,8 +106,11 @@ export function buildFinancialAttestationMessage(
     binding.companyCommitmentHash,
     binding.giwaReceivableBindingHash,
     binding.midnightDeploymentHash,
+    binding.policyRequestHash,
     binding.providerId ?? 1n,
-    binding.policyVersion ?? POLICY_VERSION,
+    binding.evaluationVersion ?? EVALUATION_VERSION,
+    binding.profileAsOf ?? PROFILE_AS_OF,
+    binding.validUntil ?? DEFAULT_POLICY_REQUEST.validUntil,
   ];
 }
 
@@ -184,6 +203,7 @@ export function createSignedFinancialProfile(
     overdueCount,
     attestationSignature: schnorrSign(providerSk, message),
     attestationProviderId: providerId,
+    attestationProfileAsOf: binding.profileAsOf ?? PROFILE_AS_OF,
     companySecretKey,
   };
 }

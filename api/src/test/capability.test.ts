@@ -1,21 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import {
-  DEFAULT_GASOK_CONTRACT_ADDRESS,
-  GIWA_RECEIVABLE_FINANCE_ADDRESS,
-} from '../config.js';
+import { DEFAULT_GASOK_CONTRACT_ADDRESS } from '../config.js';
 import { verifyProofCapability } from '../capability.js';
 import { createValidCapability } from './fixture.js';
 
-describe('proof capability v1', () => {
-  it('recomputes and accepts the exact lookup key while normalizing public context', () => {
-    const input = createValidCapability({
-      midnightContractAddress: DEFAULT_GASOK_CONTRACT_ADDRESS.toUpperCase(),
-      companyCommitment: createValidCapability().companyCommitment.toUpperCase().replace('0X', '0x'),
-      lookupKey: createValidCapability().lookupKey.toUpperCase().replace('0X', '0x'),
-      receivableFinanceAddress: GIWA_RECEIVABLE_FINANCE_ADDRESS.toUpperCase().replace('0X', '0x'),
-      partyWallet: createValidCapability().partyWallet.toUpperCase().replace('0X', '0x'),
-    });
-
+describe('proof capability v2', () => {
+  it('recomputes and accepts the exact policy and lookup hashes', () => {
+    const input = createValidCapability();
     const verified = verifyProofCapability(input, DEFAULT_GASOK_CONTRACT_ADDRESS);
 
     expect(verified.capability).toEqual(createValidCapability());
@@ -36,6 +26,12 @@ describe('proof capability v1', () => {
     ['receivable ID', { onchainReceivableId: '8' }],
     ['subject role', { subjectRole: 'BUYER' }],
     ['party wallet', { partyWallet: `0x${'44'.repeat(20)}` }],
+    ['request ID', { requestId: `0x${'55'.repeat(32)}` }],
+    ['intended Funder', { intendedFunderWallet: `0x${'55'.repeat(20)}` }],
+    ['minimum revenue', { minAnnualRevenueKrw: '500000001' }],
+    ['maximum debt ratio', { maxDebtRatioBps: '19999' }],
+    ['maximum overdue count', { maxOverdueCount: '0' }],
+    ['valid-until', { validUntil: '4000000001' }],
   ] as const)('rejects reuse after changing the bound %s', (_label, override) => {
     expect(() => verifyProofCapability(
       createValidCapability(override),
@@ -55,13 +51,17 @@ describe('proof capability v1', () => {
   });
 
   it.each([
-    ['version', { version: 2 }],
+    ['version', { version: 1 }],
     ['zero ID', { onchainReceivableId: '0' }],
     ['non-canonical ID', { onchainReceivableId: '07' }],
     ['invalid role', { subjectRole: 'FUNDER' }],
     ['unprefixed lookup key', { lookupKey: 'aa'.repeat(32) }],
     ['unprefixed company commitment', { companyCommitment: 'aa'.repeat(32) }],
     ['unprefixed party wallet', { partyWallet: 'aa'.repeat(20) }],
+    ['uppercase request ID', { requestId: `0x${'AA'.repeat(32)}` }],
+    ['zero intended Funder', { intendedFunderWallet: `0x${'00'.repeat(20)}` }],
+    ['inverted freshness', { profileAsOf: '4000000001' }],
+    ['zero Midnight contract', { midnightContractAddress: '0'.repeat(64) }],
   ])('rejects invalid schema: %s', (_label, override) => {
     expect(() => verifyProofCapability(
       createValidCapability(override as never),
@@ -69,10 +69,16 @@ describe('proof capability v1', () => {
     )).toThrow(expect.objectContaining({ code: 'INVALID_PROOF_CAPABILITY' }));
   });
 
-  it('rejects extra fields so raw financial values cannot enter this API', () => {
+  it.each([
+    ['annual revenue', { annualRevenueKrw: '500000000' }],
+    ['debt ratio', { debtRatioBps: '20000' }],
+    ['overdue count', { overdueCount: '1' }],
+    ['pseudonym nonce', { pseudonymNonce: '1234' }],
+    ['provider signature', { signature: 'must-not-enter-the-read-api' }],
+  ])('rejects extra %s fields so private proof material cannot enter this API', (_label, extra) => {
     const capability = {
       ...createValidCapability(),
-      annualRevenueKrw: '500000000',
+      ...extra,
     };
 
     expect(() => verifyProofCapability(

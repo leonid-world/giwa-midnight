@@ -17,7 +17,13 @@ function configuredLedger(overrides: Record<string, unknown> = {}) {
     receivableFinanceAddress: FINANCE_ADDRESS,
     eligibilityResults: {
       member: vi.fn(() => true),
-      lookup: vi.fn(() => ({ eligible: true, providerId: 1n, policyVersion: 1n })),
+      lookup: vi.fn(() => ({
+        eligible: true,
+        providerId: 1n,
+        evaluationVersion: 2n,
+        profileAsOf: 2000000000n,
+        validUntil: 4000000000n,
+      })),
     },
     ...overrides,
   };
@@ -33,7 +39,9 @@ describe('exact eligibility reader', () => {
     await expect(read(ADDRESS, LOOKUP_KEY)).resolves.toEqual({
       eligible: true,
       providerId: '1',
-      policyVersion: '1',
+      evaluationVersion: 2,
+      profileAsOf: '2000000000',
+      validUntil: '4000000000',
     });
     expect(queryContractState).toHaveBeenCalledWith(ADDRESS);
     expect(ledger.eligibilityResults.member).toHaveBeenCalledWith(LOOKUP_KEY);

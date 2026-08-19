@@ -15,7 +15,7 @@ const { pureCircuits } = GasokEligibility;
 const bytes32Type = new CompactTypeBytes(32);
 const MIDNIGHT_CONTRACT_ADDRESS_PATTERN = /^(?:0x)?([0-9a-fA-F]{64})$/;
 export const DEFAULT_APPROVED_MIDNIGHT_CONTRACT_ADDRESS =
-  '7e3ea9d741ce0f5862db6f46d0ad720be2586cd7d0405ec77e4a0478aa50f4fb' as const;
+  '12caaf76aef1de1c584b67462018810f6e4e7eb2535e136f560cb621e24a3f36' as const;
 
 export interface AttestationContext {
   midnightContractAddress: string;

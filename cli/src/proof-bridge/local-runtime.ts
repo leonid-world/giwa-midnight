@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import type * as http from 'node:http';
+import { randomBytes } from 'node:crypto';
 import type { ContractAddress } from '@midnight-ntwrk/midnight-js-protocol/compact-runtime';
 import type { Logger } from 'pino';
 import * as api from '../api.js';
@@ -16,9 +17,10 @@ import {
 } from '../giwa.js';
 import { ProofBridgeRuntime, type ProofBridgeOperations } from './runtime.js';
 import { createProofBridgeServer } from './server.js';
+import { openCapabilityOutbox, type ProofCapabilityOutbox } from './capability-outbox.js';
 
 export const PINNED_MIDNIGHT_CONTRACT_ADDRESS =
-  '7e3ea9d741ce0f5862db6f46d0ad720be2586cd7d0405ec77e4a0478aa50f4fb' as ContractAddress;
+  '12caaf76aef1de1c584b67462018810f6e4e7eb2535e136f560cb621e24a3f36' as ContractAddress;
 export const LOCAL_ATTESTATION_API_URL = 'http://127.0.0.1:4000';
 export const LOCAL_PROOF_BRIDGE_HOST = '127.0.0.1';
 export const LOCAL_PROOF_BRIDGE_PORT = 4_200;
@@ -26,6 +28,16 @@ export const LOCAL_DEV_GENESIS_WALLET_SEED = '0000000000000000000000000000000000
 const PROVIDER_ID = 2n;
 const PROVIDER_INFO_MAX_BYTES = 4_096;
 export const INDEXER_PREFLIGHT_TIMEOUT_MS = 10_000;
+
+export function generatePseudonymNonce(
+  random: (size: number) => Buffer = randomBytes,
+): bigint {
+  const bytes = random(2);
+  if (bytes.length !== 2) {
+    throw new Error('The local pseudonym nonce generator returned an invalid value.');
+  }
+  return BigInt(bytes.readUInt16BE(0));
+}
 
 export interface ProviderInfo {
   readonly providerId: 2;
@@ -106,7 +118,7 @@ export function parseProviderInfo(value: unknown): ProviderInfo {
     ]) ||
     value.providerId !== 2 ||
     value.attestationType !== 'mock' ||
-    value.authorizationProtocol !== 'eip712-role-wallet-v1' ||
+    value.authorizationProtocol !== 'eip712-role-wallet-v2' ||
     typeof value.approvedMidnightContractAddress !== 'string' ||
     value.approvedMidnightContractAddress !== PINNED_MIDNIGHT_CONTRACT_ADDRESS ||
     !isRecord(value.publicKey) ||
@@ -238,6 +250,9 @@ function createLocalOperations(
 ): ProofBridgeOperations<api.PreparedEligibilityVerification> {
   return {
     async prepare(input) {
+      // The nonce only pseudonymizes the local company commitment. It is not
+      // a user credential and must never cross the browser boundary.
+      const pseudonymNonce = generatePseudonymNonce();
       const prepared = await api.prepareEligibilityVerificationWithGiwaConfig(
         contract,
         providers,
@@ -247,7 +262,8 @@ function createLocalOperations(
         input.annualRevenueKrw,
         input.debtRatioBps,
         input.overdueCount,
-        input.secretPin,
+        pseudonymNonce,
+        input.policyRequest,
         LOCAL_ATTESTATION_API_URL,
       );
       return {
@@ -296,14 +312,21 @@ export async function runStandaloneProofBridge(logger: Logger): Promise<void> {
   let walletContext: api.WalletContext | null = null;
   let server: http.Server | null = null;
   let runtime: ProofBridgeRuntime<api.PreparedEligibilityVerification> | null = null;
+  let capabilityOutbox: ProofCapabilityOutbox | null = null;
   try {
     walletContext = await api.buildWalletFromHexSeed(config, LOCAL_DEV_GENESIS_WALLET_SEED);
     const providers = await api.configureProviders(walletContext, config);
+    const storagePassword = process.env.MIDNIGHT_STORAGE_PASSWORD;
+    if (!storagePassword) {
+      throw new Error('MIDNIGHT_STORAGE_PASSWORD is required for the encrypted proof result outbox.');
+    }
+    capabilityOutbox = await openCapabilityOutbox({ password: storagePassword });
     const configuredGiwa = await preflightContractAndProvider(providers, PINNED_MIDNIGHT_CONTRACT_ADDRESS);
     await requireExistingPinnedPrivateState(providers);
     const contract = await api.joinContract(providers, PINNED_MIDNIGHT_CONTRACT_ADDRESS);
     runtime = new ProofBridgeRuntime({
       operations: createLocalOperations(providers, contract, configuredGiwa),
+      outbox: capabilityOutbox,
       logger,
     });
     server = createProofBridgeServer({ controller: runtime });
@@ -324,6 +347,7 @@ export async function runStandaloneProofBridge(logger: Logger): Promise<void> {
       await closeServer(server);
     }
     await runtime?.shutdown();
+    capabilityOutbox?.close();
     if (walletContext !== null) {
       await api.closeWallet(walletContext);
     }

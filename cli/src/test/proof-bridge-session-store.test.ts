@@ -9,7 +9,8 @@ const SESSION_A = `0x${'1'.repeat(64)}`;
 const SESSION_B = `0x${'2'.repeat(64)}`;
 
 const capability: ProofCapability = {
-  version: 1,
+  version: 2,
+  evaluationVersion: 2,
   midnightContractAddress: 'a'.repeat(64),
   companyCommitment: `0x${'b'.repeat(64)}`,
   lookupKey: `0x${'c'.repeat(64)}`,
@@ -18,6 +19,14 @@ const capability: ProofCapability = {
   onchainReceivableId: '1',
   subjectRole: 'SELLER',
   partyWallet: `0x${'e'.repeat(40)}`,
+  requestId: `0x${'1'.repeat(64)}`,
+  intendedFunderWallet: `0x${'2'.repeat(40)}`,
+  minAnnualRevenueKrw: '500000000',
+  maxDebtRatioBps: '20000',
+  maxOverdueCount: '1',
+  policyRequestHash: `0x${'3'.repeat(64)}`,
+  profileAsOf: '1000',
+  validUntil: '2000',
 };
 
 describe('ProofSessionStore', () => {
@@ -44,7 +53,7 @@ describe('ProofSessionStore', () => {
     store.setStage(sessionId, 'indexing');
     store.complete(sessionId, capability);
     expect(store.status(sessionId)).toEqual({
-      version: 1,
+      version: 2,
       sessionId,
       status: 'complete',
       proofCapability: capability,

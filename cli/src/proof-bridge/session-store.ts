@@ -190,6 +190,25 @@ export class ProofSessionStore<Prepared> {
     return this.#toResponse(this.#require(sessionId));
   }
 
+  forgetAcknowledgedCapability(sessionId: string, requestId: string): void {
+    this.#sweep();
+    const session = this.#sessions.get(sessionId);
+    if (session === undefined) {
+      return;
+    }
+    if (
+      session.status !== 'complete' ||
+      session.proofCapability === undefined ||
+      session.proofCapability.requestId !== requestId
+    ) {
+      throw new ProofSessionStoreError(
+        'PROOF_RESULT_BINDING_MISMATCH',
+        'The proof result acknowledgement does not match the finalized request and session.',
+      );
+    }
+    this.#removeSession(sessionId);
+  }
+
   #require(sessionId: string): SessionRecord<Prepared> {
     if (!SESSION_ID_PATTERN.test(sessionId)) {
       throw new ProofSessionStoreError('PROOF_SESSION_NOT_FOUND', 'The local proof session was not found.');

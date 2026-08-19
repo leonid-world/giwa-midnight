@@ -40,7 +40,7 @@ describe('Schnorr signing', () => {
         'Provider secret key must be between 1 and the Jubjub order minus 1',
       );
       expect(() => getPublicKey(invalidSecretKey)).toThrow();
-      expect(() => sign(invalidSecretKey, [1n, 2n, 3n, 4n, 5n, 6n, 7n, 8n])).toThrow();
+      expect(() => sign(invalidSecretKey, [1n, 2n, 3n, 4n, 5n, 6n, 7n, 8n, 9n, 10n, 11n])).toThrow();
     },
   );
 
@@ -53,7 +53,7 @@ describe('Schnorr signing', () => {
 
   it('produces signatures that verify correctly', () => {
     const { sk, pk } = generateKeyPair();
-    const msg = [1n, 2n, 3n, 4n, 5n, 6n, 7n, 8n];
+    const msg = [1n, 2n, 3n, 4n, 5n, 6n, 7n, 8n, 9n, 10n, 11n];
     const sig = sign(sk, msg);
 
     // Manual verification: G*s == R + P*c
@@ -73,8 +73,8 @@ describe('Schnorr signing', () => {
 
   it('produces different signatures for different messages', () => {
     const { sk } = generateKeyPair();
-    const msg1 = [1n, 2n, 3n, 4n, 5n, 6n, 7n, 8n];
-    const msg2 = [8n, 7n, 6n, 5n, 4n, 3n, 2n, 1n];
+    const msg1 = [1n, 2n, 3n, 4n, 5n, 6n, 7n, 8n, 9n, 10n, 11n];
+    const msg2 = [11n, 10n, 9n, 8n, 7n, 6n, 5n, 4n, 3n, 2n, 1n];
 
     const sig1 = sign(sk, msg1);
     const sig2 = sign(sk, msg2);
@@ -88,8 +88,11 @@ describe('Schnorr signing', () => {
     const companyCommitmentHash = 12345678901234567890n;
     const bindingHashField = 555n;
     const deploymentHashField = 666n;
+    const policyRequestHashField = 777n;
     const providerId = 42n;
-    const policyVersion = 1n;
+    const evaluationVersion = 2n;
+    const profileAsOf = 1_700_000_000n;
+    const validUntil = 1_700_000_600n;
 
     const sig = signFinancialData(
       sk,
@@ -99,8 +102,11 @@ describe('Schnorr signing', () => {
       companyCommitmentHash,
       bindingHashField,
       deploymentHashField,
+      policyRequestHashField,
       providerId,
-      policyVersion,
+      evaluationVersion,
+      profileAsOf,
+      validUntil,
     );
 
     // Verify manually
@@ -111,8 +117,11 @@ describe('Schnorr signing', () => {
       companyCommitmentHash,
       bindingHashField,
       deploymentHashField,
+      policyRequestHashField,
       providerId,
-      policyVersion,
+      evaluationVersion,
+      profileAsOf,
+      validUntil,
     );
     expect(msg).toEqual([
       500_000_000n,
@@ -121,8 +130,11 @@ describe('Schnorr signing', () => {
       companyCommitmentHash,
       bindingHashField,
       deploymentHashField,
+      policyRequestHashField,
       providerId,
-      policyVersion,
+      evaluationVersion,
+      profileAsOf,
+      validUntil,
     ]);
     const cFull = pureCircuits.schnorrChallenge(
       sig.announcement.x, sig.announcement.y,
@@ -140,7 +152,7 @@ describe('Schnorr signing', () => {
 
   it('signature response is within Jubjub scalar field', () => {
     const { sk } = generateKeyPair();
-    const msg = [100n, 200n, 300n, 400n, 500n, 600n, 700n, 800n];
+    const msg = [100n, 200n, 300n, 400n, 500n, 600n, 700n, 800n, 900n, 1000n, 1100n];
 
     for (let i = 0; i < 10; i++) {
       const sig = sign(sk, msg);
@@ -150,7 +162,7 @@ describe('Schnorr signing', () => {
   });
 
   it('challenge hash is deterministic for same inputs', () => {
-    const message = [5n, 6n, 7n, 8n, 9n, 10n, 11n, 12n];
+    const message = [5n, 6n, 7n, 8n, 9n, 10n, 11n, 12n, 13n, 14n, 15n];
     const cFull1 = pureCircuits.schnorrChallenge(1n, 2n, 3n, 4n, message);
     const cFull2 = pureCircuits.schnorrChallenge(1n, 2n, 3n, 4n, message);
     expect(cFull1).toEqual(cFull2);

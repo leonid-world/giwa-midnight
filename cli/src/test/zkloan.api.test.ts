@@ -70,6 +70,14 @@ describe('GASOK Financial Eligibility API', () => {
       20_000n,
       1n,
       secretPin,
+      {
+        requestId: `0x${'11'.repeat(32)}`,
+        intendedFunderWallet: `0x${'22'.repeat(20)}`,
+        minAnnualRevenueKrw: 500_000_000n,
+        maxDebtRatioBps: 20_000n,
+        maxOverdueCount: 1n,
+        validUntil: BigInt(Math.floor(Date.now() / 1_000)) + 600n,
+      },
       attestationApiUrl,
       async () => {
         throw new Error('The slow integration test requires an injected GIWA role-wallet signer.');

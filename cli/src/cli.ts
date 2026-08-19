@@ -14,6 +14,7 @@
 // limitations under the License.
 
 import { stdin as input, stdout as output } from 'node:process';
+import { randomBytes } from 'node:crypto';
 import { createInterface, type Interface } from 'node:readline/promises';
 import { type Logger } from 'pino';
 import { type StartedDockerComposeEnvironment, type DockerComposeEnvironment } from 'testcontainers';
@@ -147,7 +148,12 @@ const verifyEligibilityFlow = async (
   const annualRevenueKrwStr = await rli.question('Enter annual revenue in integer KRW: ');
   const debtRatioBpsStr = await rli.question('Enter debt ratio in basis points (200.00% = 20000): ');
   const overdueCountStr = await rli.question('Enter overdue count: ');
-  const pinStr = await rli.question('Enter your secret PIN: ');
+  const nonceStr = await rli.question('Enter a local pseudonym nonce (uint16; browser flow generates this automatically): ');
+  const intendedFunderWallet = (await rli.question('Enter the intended Funder wallet (0x + 40 lowercase hex): ')).trim();
+  const minAnnualRevenueKrwStr = await rli.question('Enter the Funder minimum annual revenue in integer KRW: ');
+  const maxDebtRatioBpsStr = await rli.question('Enter the Funder maximum debt ratio in basis points: ');
+  const maxOverdueCountStr = await rli.question('Enter the Funder maximum overdue count: ');
+  const validForSecondsStr = await rli.question('Enter policy validity duration in seconds: ');
 
   const onchainReceivableId = parseUnsignedDecimal(onchainReceivableIdStr, 'GIWA receivable ID', UINT256_MAX, {
     positive: true,
@@ -156,7 +162,21 @@ const verifyEligibilityFlow = async (
   const annualRevenueKrw = parseUnsignedDecimal(annualRevenueKrwStr, 'Annual revenue', UINT64_MAX);
   const debtRatioBps = parseUnsignedDecimal(debtRatioBpsStr, 'Debt ratio', UINT32_MAX);
   const overdueCount = parseUnsignedDecimal(overdueCountStr, 'Overdue count', UINT16_MAX);
-  const pin = parseUnsignedDecimal(pinStr, 'PIN', UINT16_MAX);
+  const pseudonymNonce = parseUnsignedDecimal(nonceStr, 'Pseudonym nonce', UINT16_MAX);
+  const minAnnualRevenueKrw = parseUnsignedDecimal(minAnnualRevenueKrwStr, 'Minimum annual revenue', UINT64_MAX);
+  const maxDebtRatioBps = parseUnsignedDecimal(maxDebtRatioBpsStr, 'Maximum debt ratio', UINT32_MAX);
+  const maxOverdueCount = parseUnsignedDecimal(maxOverdueCountStr, 'Maximum overdue count', UINT16_MAX);
+  const validForSeconds = parseUnsignedDecimal(validForSecondsStr, 'Policy validity duration', UINT64_MAX, {
+    positive: true,
+  });
+  const policyRequest = {
+    requestId: `0x${randomBytes(32).toString('hex')}`,
+    intendedFunderWallet,
+    minAnnualRevenueKrw,
+    maxDebtRatioBps,
+    maxOverdueCount,
+    validUntil: BigInt(Math.floor(Date.now() / 1_000)) + validForSeconds,
+  };
 
   const attestationApiUrl = process.env.ATTESTATION_API_URL || 'http://localhost:4000';
 
@@ -168,7 +188,8 @@ const verifyEligibilityFlow = async (
     annualRevenueKrw,
     debtRatioBps,
     overdueCount,
-    pin,
+    pseudonymNonce,
+    policyRequest,
     attestationApiUrl,
     async (challenge) => await obtainRoleAuthorization(challenge, rli),
   );

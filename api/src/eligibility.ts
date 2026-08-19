@@ -14,7 +14,9 @@ import {
 interface PublicEligibilityResult {
   readonly eligible: boolean;
   readonly providerId: bigint;
-  readonly policyVersion: bigint;
+  readonly evaluationVersion: bigint;
+  readonly profileAsOf: bigint;
+  readonly validUntil: bigint;
 }
 
 interface PublicEligibilityMap {
@@ -31,7 +33,9 @@ interface PublicEligibilityLedger {
 export interface ExactEligibilityResult {
   readonly eligible: boolean;
   readonly providerId: string;
-  readonly policyVersion: string;
+  readonly evaluationVersion: 2;
+  readonly profileAsOf: string;
+  readonly validUntil: string;
 }
 
 export type QueryContractState = (
@@ -94,14 +98,21 @@ export function createEligibilityReader({
       if (
         typeof result.eligible !== 'boolean' ||
         typeof result.providerId !== 'bigint' ||
-        typeof result.policyVersion !== 'bigint'
+        typeof result.evaluationVersion !== 'bigint' ||
+        result.evaluationVersion !== 2n ||
+        typeof result.profileAsOf !== 'bigint' ||
+        typeof result.validUntil !== 'bigint' ||
+        result.profileAsOf <= 0n ||
+        result.profileAsOf > result.validUntil
       ) {
         throw new Error('Malformed eligibility result');
       }
       return {
         eligible: result.eligible,
         providerId: result.providerId.toString(),
-        policyVersion: result.policyVersion.toString(),
+        evaluationVersion: 2,
+        profileAsOf: result.profileAsOf.toString(),
+        validUntil: result.validUntil.toString(),
       };
     } catch (error: unknown) {
       if (error instanceof PublicApiError) {

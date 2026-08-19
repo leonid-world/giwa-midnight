@@ -4,6 +4,7 @@ import { TypedDataEncoder, Wallet } from 'ethers';
 import {
   AUTHORIZATION_PROTOCOL,
   AUTHORIZATION_TTL_SECONDS,
+  AuthorizationChallengeStore,
   PROVIDER_ID,
 } from '../src/authorization.js';
 import {
@@ -51,7 +52,7 @@ describe('Attestation API EIP-712 issuance gate', () => {
   const resolver: GiwaReceivableResolver = { resolve: resolveReceivable };
 
   const validRequest: AuthorizationChallengeRequest = {
-    version: 1,
+    version: 2,
     annualRevenueKrw: '500000000',
     debtRatioBps: '20000',
     overdueCount: '1',
@@ -60,6 +61,14 @@ describe('Attestation API EIP-712 issuance gate', () => {
     midnightContractAddress,
     onchainReceivableId: '7',
     subjectRole: 'SELLER',
+    policyRequest: {
+      requestId: `0x${'33'.repeat(32)}`,
+      intendedFunderWallet: '0x4444444444444444444444444444444444444444',
+      minAnnualRevenueKrw: '500000000',
+      maxDebtRatioBps: '20000',
+      maxOverdueCount: '1',
+      validUntil: '4000000000',
+    },
   };
 
   beforeAll(async () => {
@@ -110,7 +119,7 @@ describe('Attestation API EIP-712 issuance gate', () => {
   ): Promise<AuthorizationProof> {
     const signature = await signer.signTypedData(challenge.domain, challenge.types, challenge.message);
     return {
-      version: 1,
+      version: 2,
       authorizationId: challenge.message.authorizationId,
       typedDataHash: TypedDataEncoder.hash(challenge.domain, challenge.types, challenge.message),
       signer: signer.address,
@@ -174,12 +183,15 @@ describe('Attestation API EIP-712 issuance gate', () => {
     const body = await response.json() as AuthorizationChallengeResponse;
 
     expect(Object.keys(body)).toEqual(['version', 'domain', 'primaryType', 'types', 'message']);
-    expect(body.version).toBe(1);
-    expect(body.domain).toEqual({ name: 'GASOK Mock Attestation', version: '1', chainId: '91342' });
+    expect(body.version).toBe(2);
+    expect(body.domain).toEqual({ name: 'GASOK Mock Attestation', version: '2', chainId: '91342' });
     expect(body.primaryType).toBe('GASOKRoleAttestationAuthorization');
     expect(Object.keys(body.types)).toEqual(['GASOKRoleAttestationAuthorization']);
     expect(body.message.providerId).toBe('2');
-    expect(body.message.policyVersion).toBe('1');
+    expect(body.message.evaluationVersion).toBe('2');
+    expect(body.message.requestId).toBe(validRequest.policyRequest.requestId);
+    expect(body.message.intendedFunderWallet).toBe(validRequest.policyRequest.intendedFunderWallet);
+    expect(body.message.policyValidUntil).toBe(validRequest.policyRequest.validUntil);
     expect(body.message.partyWallet).toBe(seller);
     expect(Number(body.message.issuedAt)).toBeGreaterThanOrEqual(before);
     expect(Number(body.message.issuedAt)).toBeLessThanOrEqual(after);
@@ -195,7 +207,6 @@ describe('Attestation API EIP-712 issuance gate', () => {
       'overdueCount',
       'companyCommitmentHash',
       'authorizationSalt',
-      '500000000',
       '12345678901234567890',
       'aa'.repeat(32),
     ]) {
@@ -212,7 +223,10 @@ describe('Attestation API EIP-712 issuance gate', () => {
     expect(response.status).toBe(200);
     const body = await response.json();
     expect(body.providerId).toBe(2);
-    expect(body.policyVersion).toBe(1);
+    expect(body.evaluationVersion).toBe(2);
+    expect(body.policyRequestHash).toMatch(/^0x[0-9a-f]{64}$/);
+    expect(body.profileAsOf).toBe(challenge.message.profileAsOf);
+    expect(body.validUntil).toBe(validRequest.policyRequest.validUntil);
     expect(body.authorizationProtocol).toBe(AUTHORIZATION_PROTOCOL);
     expect(body.binding).toEqual({
       giwaChainId: '91342',
@@ -239,6 +253,62 @@ describe('Attestation API EIP-712 issuance gate', () => {
     }
   });
 
+  it('clamps challenge expiry to the policy boundary and rejects an already-expired policy', async () => {
+    let now = 1_000;
+    const authorizationStore = new AuthorizationChallengeStore({ now: () => now });
+    const boundaryServer = createServer(sk, {
+      authorizationStore,
+      receivableResolver: resolver,
+      approvedMidnightContractAddress: midnightContractAddress,
+    });
+    let boundaryBaseUrl = '';
+    await new Promise<void>((resolve) => {
+      boundaryServer.listen(0, '127.0.0.1', () => {
+        const address = boundaryServer.address();
+        const port = typeof address === 'string' ? address : address?.port;
+        boundaryBaseUrl = `http://127.0.0.1:${port}`;
+        resolve();
+      });
+    });
+
+    try {
+      const issueAtBoundary = async (validUntil: string): Promise<Response> => fetch(
+        `${boundaryBaseUrl}/authorization-challenges`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            ...validRequest,
+            policyRequest: { ...validRequest.policyRequest, validUntil },
+          }),
+        },
+      );
+
+      for (const [validUntil, expectedExpiresAt, expectedTtl] of [
+        ['2000', '1120', 120n],
+        ['1119', '1119', 119n],
+        ['1001', '1001', 1n],
+      ] as const) {
+        const response = await issueAtBoundary(validUntil);
+        expect(response.status).toBe(201);
+        const challenge = await response.json() as AuthorizationChallengeResponse;
+        expect(challenge.message.expiresAt).toBe(expectedExpiresAt);
+        expect(BigInt(challenge.message.expiresAt) - BigInt(challenge.message.issuedAt)).toBe(expectedTtl);
+      }
+
+      const expired = await issueAtBoundary('1000');
+      expect(expired.status).toBe(409);
+      expect(await expired.json()).toEqual({
+        error: {
+          code: 'POLICY_REQUEST_EXPIRED',
+          message: 'The Funder policy request has expired.',
+        },
+      });
+    } finally {
+      await new Promise<void>((resolve) => boundaryServer.close(() => resolve()));
+    }
+  });
+
   it('preserves a uint256 maximum receivable ID', async () => {
     const onchainReceivableId = ((1n << 256n) - 1n).toString();
     const challenge = await issueChallenge({ onchainReceivableId });
@@ -247,9 +317,11 @@ describe('Attestation API EIP-712 issuance gate', () => {
     expect((await response.json()).binding.onchainReceivableId).toBe(onchainReceivableId);
   });
 
-  it('consumes a challenge before rejecting a bad signature', async () => {
+  it('keeps a malformed signature generic and consumes its challenge', async () => {
     const challenge = await issueChallenge();
-    const invalid = await attest(challenge, buyerWallet);
+    const invalid = await attest(challenge, sellerWallet, {}, {
+      signature: `0x${'00'.repeat(65)}`,
+    });
     expect(invalid.status).toBe(401);
     expect(await invalid.json()).toEqual({
       error: {
@@ -263,6 +335,32 @@ describe('Attestation API EIP-712 issuance gate', () => {
     expect((await replay.json()).error.code).toBe('AUTHORIZATION_INVALID');
   });
 
+  it('returns only a fixed 403 when a valid recoverable signer is not the canonical role wallet', async () => {
+    const challenge = await issueChallenge();
+    const wrongProof = await signChallenge(challenge, buyerWallet);
+    const invalid = await post('/attest', {
+      ...validRequest,
+      authorization: wrongProof,
+    });
+    expect(invalid.status).toBe(403);
+    const serialized = await invalid.text();
+    expect(JSON.parse(serialized)).toEqual({
+      error: {
+        code: 'ROLE_WALLET_MISMATCH',
+        message: 'The wallet authorization does not match the current GIWA role wallet.',
+      },
+    });
+    expect(serialized).not.toContain(sellerWallet.address);
+    expect(serialized).not.toContain(buyerWallet.address);
+    expect(serialized).not.toContain(challenge.message.partyWallet);
+    expect(serialized).not.toContain(wrongProof.signature);
+    expect(serialized).not.toContain(wrongProof.authorizationId);
+
+    const replay = await attest(challenge, sellerWallet);
+    expect(replay.status).toBe(401);
+    expect((await replay.json()).error.code).toBe('AUTHORIZATION_INVALID');
+  });
+
   it.each([
     ['financial value', { annualRevenueKrw: '500000001' }],
     ['company commitment', { companyCommitmentHash: '999' }],
@@ -270,6 +368,21 @@ describe('Attestation API EIP-712 issuance gate', () => {
     ['Midnight deployment', { midnightContractAddress: 'bb'.repeat(32) }],
     ['receivable ID', { onchainReceivableId: '8' }],
     ['subject role', { subjectRole: 'BUYER' as const }],
+    ['policy request ID', {
+      policyRequest: { ...validRequest.policyRequest, requestId: `0x${'55'.repeat(32)}` },
+    }],
+    ['policy audience', {
+      policyRequest: {
+        ...validRequest.policyRequest,
+        intendedFunderWallet: '0x6666666666666666666666666666666666666666',
+      },
+    }],
+    ['policy threshold', {
+      policyRequest: { ...validRequest.policyRequest, maxDebtRatioBps: '19999' },
+    }],
+    ['policy expiry', {
+      policyRequest: { ...validRequest.policyRequest, validUntil: '4000000001' },
+    }],
   ])('rejects and consumes a challenge when the %s changes', async (_label, overrides) => {
     const challenge = await issueChallenge();
     const response = await attest(challenge, sellerWallet, overrides);
@@ -279,7 +392,7 @@ describe('Attestation API EIP-712 issuance gate', () => {
     expect(replay.status).toBe(401);
   });
 
-  it('rejects typed-data hash and signer claims that do not match the reconstructed message', async () => {
+  it('keeps a bad typed-data hash generic but distinguishes a valid wrong declared signer', async () => {
     const hashChallenge = await issueChallenge();
     const badHash = await attest(hashChallenge, sellerWallet, {}, {
       typedDataHash: `0x${'ff'.repeat(32)}`,
@@ -290,14 +403,29 @@ describe('Attestation API EIP-712 issuance gate', () => {
     const badSigner = await attest(signerChallenge, sellerWallet, {}, {
       signer: buyerWallet.address,
     });
-    expect(badSigner.status).toBe(401);
+    expect(badSigner.status).toBe(403);
+    expect(await badSigner.json()).toEqual({
+      error: {
+        code: 'ROLE_WALLET_MISMATCH',
+        message: 'The wallet authorization does not match the current GIWA role wallet.',
+      },
+    });
   });
 
   it('re-resolves GIWA and rejects a role-wallet change after challenge issuance', async () => {
     const challenge = await issueChallenge();
     seller = replacementWallet.address.toLowerCase();
     const response = await attest(challenge, sellerWallet);
-    expect(response.status).toBe(401);
+    expect(response.status).toBe(403);
+    const serialized = await response.text();
+    expect(JSON.parse(serialized)).toEqual({
+      error: {
+        code: 'ROLE_WALLET_MISMATCH',
+        message: 'The wallet authorization does not match the current GIWA role wallet.',
+      },
+    });
+    expect(serialized).not.toContain(sellerWallet.address);
+    expect(serialized).not.toContain(replacementWallet.address);
     expect(resolveReceivable).toHaveBeenCalledTimes(2);
   });
 
@@ -329,7 +457,7 @@ describe('Attestation API EIP-712 issuance gate', () => {
     ['negative ID', { onchainReceivableId: '-1' }],
     ['uint256 overflow', { onchainReceivableId: (1n << 256n).toString() }],
     ['invalid role', { subjectRole: 'FUNDER' as never }],
-    ['invalid version', { version: 2 as never }],
+    ['invalid version', { version: 1 as never }],
     ['invalid salt', { authorizationSalt: '0x1234' }],
     ['zero salt', { authorizationSalt: `0x${'0'.repeat(64)}` }],
     ['numeric revenue', { annualRevenueKrw: 500000000 as never }],

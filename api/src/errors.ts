@@ -31,7 +31,7 @@ export const requestBodyTooLarge = () =>
   new PublicApiError(413, 'REQUEST_BODY_TOO_LARGE', 'The request body is too large.');
 
 export const invalidProofCapability = () =>
-  new PublicApiError(400, 'INVALID_PROOF_CAPABILITY', 'The proof capability does not match the v1 schema.');
+  new PublicApiError(400, 'INVALID_PROOF_CAPABILITY', 'The proof capability does not match the v2 schema.');
 
 export const unapprovedGiwaContext = () =>
   new PublicApiError(400, 'UNAPPROVED_GIWA_CONTEXT', 'The proof capability is not for the configured GIWA deployment.');
@@ -41,3 +41,6 @@ export const capabilityLookupMismatch = () =>
 
 export const eligibilityResultNotFound = () =>
   new PublicApiError(404, 'ELIGIBILITY_RESULT_NOT_FOUND', 'No eligibility result exists for this proof capability.');
+
+export const proofResultExpired = () =>
+  new PublicApiError(410, 'PROOF_RESULT_EXPIRED', 'This Funder policy proof result has expired.');

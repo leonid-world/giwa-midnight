@@ -9,6 +9,8 @@ import {
   AuthorizationChallengeStore,
   AuthorizationGenerationError,
   AuthorizationValidationError,
+  PolicyRequestExpiredError,
+  RoleWalletMismatchError,
   buildAttestationRequestCommitment,
   buildAuthorizationChallengeResponse,
   buildAuthorizationMessage,
@@ -18,7 +20,7 @@ import {
 } from '../src/authorization.js';
 import type { ParsedAttestationRequest } from '../src/types.js';
 
-const midnightContractAddress = '7e3ea9d741ce0f5862db6f46d0ad720be2586cd7d0405ec77e4a0478aa50f4fb';
+const midnightContractAddress = '12caaf76aef1de1c584b67462018810f6e4e7eb2535e136f560cb621e24a3f36';
 const wallet = new Wallet('0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d');
 
 function request(overrides: Partial<ParsedAttestationRequest> = {}): ParsedAttestationRequest {
@@ -31,6 +33,14 @@ function request(overrides: Partial<ParsedAttestationRequest> = {}): ParsedAttes
     midnightContractAddress,
     onchainReceivableId: 7n,
     subjectRole: 'SELLER',
+    policyRequest: {
+      requestId: `0x${'33'.repeat(32)}`,
+      intendedFunderWallet: '0x4444444444444444444444444444444444444444',
+      minAnnualRevenueKrw: 500_000_000n,
+      maxDebtRatioBps: 20_000n,
+      maxOverdueCount: 1n,
+      validUntil: 4_000_000_000n,
+    },
     ...overrides,
   };
 }
@@ -39,7 +49,7 @@ describe('EIP-712 role-wallet authorization protocol', () => {
   it('publishes the exact agreed domain and ordered primary type only', () => {
     expect(AUTHORIZATION_DOMAIN).toEqual({
       name: 'GASOK Mock Attestation',
-      version: '1',
+      version: '2',
       chainId: '91342',
     });
     expect(Object.keys(AUTHORIZATION_TYPES)).toEqual([AUTHORIZATION_PRIMARY_TYPE]);
@@ -51,9 +61,16 @@ describe('EIP-712 role-wallet authorization protocol', () => {
       { name: 'onchainReceivableId', type: 'uint256' },
       { name: 'subjectRole', type: 'string' },
       { name: 'partyWallet', type: 'address' },
+      { name: 'requestId', type: 'bytes32' },
+      { name: 'intendedFunderWallet', type: 'address' },
+      { name: 'minAnnualRevenueKrw', type: 'uint64' },
+      { name: 'maxDebtRatioBps', type: 'uint32' },
+      { name: 'maxOverdueCount', type: 'uint16' },
       { name: 'attestationRequestCommitment', type: 'bytes32' },
       { name: 'providerId', type: 'uint16' },
-      { name: 'policyVersion', type: 'uint16' },
+      { name: 'evaluationVersion', type: 'uint16' },
+      { name: 'profileAsOf', type: 'uint64' },
+      { name: 'policyValidUntil', type: 'uint64' },
       { name: 'issuedAt', type: 'uint64' },
       { name: 'expiresAt', type: 'uint64' },
     ]);
@@ -63,7 +80,8 @@ describe('EIP-712 role-wallet authorization protocol', () => {
     expect(buildAttestationRequestCommitment(
       request(),
       '0x1111111111111111111111111111111111111111',
-    )).toBe('0xafe5640e5716c74ac0b70cce451e0f4fd7779d7c8a9847a91c7d00f114e8ab9d');
+      '1700000000',
+    )).toMatch(/^0x[0-9a-f]{64}$/);
   });
 
   it('rejects a calculated zero attestation request commitment', () => {
@@ -81,9 +99,24 @@ describe('EIP-712 role-wallet authorization protocol', () => {
     ['receivable ID', { onchainReceivableId: 8n }, wallet.address],
     ['subject role', { subjectRole: 'BUYER' as const }, wallet.address],
     ['party wallet', {}, '0x2222222222222222222222222222222222222222'],
+    ['policy request ID', {
+      policyRequest: { ...request().policyRequest, requestId: `0x${'44'.repeat(32)}` },
+    }, wallet.address],
+    ['policy audience', {
+      policyRequest: {
+        ...request().policyRequest,
+        intendedFunderWallet: '0x5555555555555555555555555555555555555555',
+      },
+    }, wallet.address],
+    ['policy thresholds', {
+      policyRequest: { ...request().policyRequest, minAnnualRevenueKrw: 500_000_001n },
+    }, wallet.address],
+    ['policy expiry', {
+      policyRequest: { ...request().policyRequest, validUntil: 4_000_000_001n },
+    }, wallet.address],
   ])('binds the %s into the hidden request commitment', (_label, overrides, partyWallet) => {
-    const original = buildAttestationRequestCommitment(request(), wallet.address);
-    const changed = buildAttestationRequestCommitment(request(overrides), partyWallet);
+    const original = buildAttestationRequestCommitment(request(), wallet.address, '1700000000');
+    const changed = buildAttestationRequestCommitment(request(overrides), partyWallet, '1700000000');
     expect(changed).not.toBe(original);
   });
 
@@ -106,6 +139,46 @@ describe('EIP-712 role-wallet authorization protocol', () => {
     expect(serialized).not.toContain('aa'.repeat(32));
   });
 
+  it.each([
+    ['normal 120-second window', 2_000n, '1120', 120n],
+    ['119-second policy remainder', 1_119n, '1119', 119n],
+    ['one-second policy remainder', 1_001n, '1001', 1n],
+  ])('bounds the %s by the earlier authorization or policy expiry', (
+    _label,
+    validUntil,
+    expectedExpiresAt,
+    expectedTtl,
+  ) => {
+    const policyBoundRequest = request({
+      policyRequest: { ...request().policyRequest, validUntil },
+    });
+    const message = buildAuthorizationMessage(
+      policyBoundRequest,
+      wallet.address,
+      `0x${'11'.repeat(32)}`,
+      '1000',
+      '1120',
+    );
+
+    expect(message.expiresAt).toBe(expectedExpiresAt);
+    expect(BigInt(message.expiresAt) - BigInt(message.issuedAt)).toBe(expectedTtl);
+  });
+
+  it('rejects an already-expired policy and authorization TTLs outside 1..120 seconds', () => {
+    const expiredRequest = request({
+      policyRequest: { ...request().policyRequest, validUntil: 1_000n },
+    });
+    expect(() => buildAuthorizationMessage(
+      expiredRequest,
+      wallet.address,
+      `0x${'11'.repeat(32)}`,
+      '1000',
+      '1120',
+    )).toThrow(PolicyRequestExpiredError);
+    expect(() => new AuthorizationChallengeStore({ ttlSeconds: 0 })).toThrow(RangeError);
+    expect(() => new AuthorizationChallengeStore({ ttlSeconds: 121 })).toThrow(RangeError);
+  });
+
   it('hashes and verifies an exact ethers v6 EIP-712 signature', async () => {
     const message = buildAuthorizationMessage(
       request(),
@@ -119,7 +192,7 @@ describe('EIP-712 role-wallet authorization protocol', () => {
 
     expect(hashAuthorizationMessage(message)).toBe(typedDataHash);
     expect(() => verifyAuthorizationSignature(message, {
-      version: 1,
+      version: 2,
       authorizationId: message.authorizationId,
       typedDataHash,
       signer: wallet.address,
@@ -127,8 +200,7 @@ describe('EIP-712 role-wallet authorization protocol', () => {
     }, wallet.address)).not.toThrow();
   });
 
-  it('rejects a different signer, hash, signature, or authorization ID', async () => {
-    const other = new Wallet('0x8b3a350cf5c34c9194ca3a545dbe4035957f353df9e4cb8a3173f8a2f1a7e682');
+  it('keeps malformed authorization material in the generic validation error class', async () => {
     const message = buildAuthorizationMessage(
       request(),
       wallet.address,
@@ -138,7 +210,7 @@ describe('EIP-712 role-wallet authorization protocol', () => {
     );
     const signature = await wallet.signTypedData(AUTHORIZATION_DOMAIN, AUTHORIZATION_TYPES, message);
     const validProof = {
-      version: 1 as const,
+      version: 2 as const,
       authorizationId: message.authorizationId,
       typedDataHash: hashAuthorizationMessage(message),
       signer: wallet.address,
@@ -146,14 +218,50 @@ describe('EIP-712 role-wallet authorization protocol', () => {
     };
 
     for (const proof of [
-      { ...validProof, signer: other.address },
       { ...validProof, typedDataHash: `0x${'ff'.repeat(32)}` },
-      { ...validProof, signature: await other.signTypedData(AUTHORIZATION_DOMAIN, AUTHORIZATION_TYPES, message) },
+      { ...validProof, signature: '0x1234' },
+      { ...validProof, signature: `0x${'00'.repeat(65)}` },
       { ...validProof, authorizationId: `0x${'22'.repeat(32)}` },
     ]) {
-      expect(() => verifyAuthorizationSignature(message, proof, wallet.address))
-        .toThrow(AuthorizationValidationError);
+      let thrown: unknown;
+      try {
+        verifyAuthorizationSignature(message, proof, wallet.address);
+      } catch (error: unknown) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(AuthorizationValidationError);
+      expect(thrown).not.toBeInstanceOf(RoleWalletMismatchError);
     }
+  });
+
+  it('distinguishes only valid recoverable signer identities that differ from the role wallet', async () => {
+    const other = new Wallet('0x8b3a350cf5c34c9194ca3a545dbe4035957f353df9e4cb8a3173f8a2f1a7e682');
+    const message = buildAuthorizationMessage(
+      request(),
+      wallet.address,
+      `0x${'11'.repeat(32)}`,
+      '1700000000',
+      '1700000120',
+    );
+    const typedDataHash = hashAuthorizationMessage(message);
+    const canonicalSignature = await wallet.signTypedData(AUTHORIZATION_DOMAIN, AUTHORIZATION_TYPES, message);
+    const otherSignature = await other.signTypedData(AUTHORIZATION_DOMAIN, AUTHORIZATION_TYPES, message);
+
+    expect(() => verifyAuthorizationSignature(message, {
+      version: 2,
+      authorizationId: message.authorizationId,
+      typedDataHash,
+      signer: wallet.address,
+      signature: otherSignature,
+    }, wallet.address)).toThrow(RoleWalletMismatchError);
+
+    expect(() => verifyAuthorizationSignature(message, {
+      version: 2,
+      authorizationId: message.authorizationId,
+      typedDataHash,
+      signer: other.address,
+      signature: canonicalSignature,
+    }, wallet.address)).toThrow(RoleWalletMismatchError);
   });
 
   it('takes a challenge exactly once', () => {

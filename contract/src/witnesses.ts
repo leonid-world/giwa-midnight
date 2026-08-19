@@ -19,6 +19,7 @@ export type GasokEligibilityPrivateState = {
   overdueCount: bigint;
   attestationSignature: SchnorrSignature;
   attestationProviderId: bigint;
+  attestationProfileAsOf: bigint;
   companySecretKey: Uint8Array;
 };
 
@@ -29,7 +30,7 @@ export const witnesses = {
     privateState,
   }: WitnessContext<Ledger, GasokEligibilityPrivateState>): [
     GasokEligibilityPrivateState,
-    [{ annualRevenueKrw: bigint; debtRatioBps: bigint; overdueCount: bigint }, SchnorrSignature, bigint],
+    [{ annualRevenueKrw: bigint; debtRatioBps: bigint; overdueCount: bigint }, SchnorrSignature, bigint, bigint],
   ] => [
     privateState,
     [
@@ -40,6 +41,7 @@ export const witnesses = {
       },
       privateState.attestationSignature,
       privateState.attestationProviderId,
+      privateState.attestationProfileAsOf,
     ],
   ],
 

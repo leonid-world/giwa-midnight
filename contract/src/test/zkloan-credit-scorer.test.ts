@@ -7,6 +7,7 @@ import { ecAdd, ecMul, ecMulGenerator } from '@midnight-ntwrk/midnight-js-protoc
 import { describe, expect, it } from 'vitest';
 import {
   pureCircuits,
+  type FunderPolicyRequest,
   type GiwaReceivableSubject,
 } from '../managed/zkloan-credit-scorer/contract/index.js';
 import { GasokEligibilitySimulator } from './zkloan-credit-scorer.simulator.js';
@@ -20,6 +21,7 @@ import {
   UINT256_MAX,
   bytesToUint256,
   createGiwaReceivableSubject,
+  DEFAULT_POLICY_REQUEST,
   createSignedFinancialProfile,
   evmAddressToBytes,
   generateProviderKeyPair,
@@ -47,6 +49,7 @@ describe('GASOK financial eligibility contract', () => {
       giwaChainId?: bigint;
       receivableFinanceAddress?: Uint8Array;
       midnightContractAddressBytes?: Uint8Array;
+      policyRequest?: FunderPolicyRequest;
     } = {},
   ): void {
     const pin = options.pin ?? defaultPin;
@@ -59,6 +62,7 @@ describe('GASOK financial eligibility contract', () => {
       receivableFinanceAddress: options.receivableFinanceAddress,
       midnightContractAddressBytes: options.midnightContractAddressBytes,
       providerId,
+      policyRequest: options.policyRequest,
     });
 
     simulator.setPrivateState(
@@ -95,8 +99,67 @@ describe('GASOK financial eligibility contract', () => {
     expect(readResult(simulator)).toEqual({
       eligible: true,
       providerId: 1n,
-      policyVersion: 1n,
+      evaluationVersion: 2n,
+      profileAsOf: 1n,
+      validUntil: 4000000000n,
     });
+  });
+
+  it('evaluates the exact Funder thresholds rather than a hard-coded policy', () => {
+    const simulator = new GasokEligibilitySimulator();
+    const relaxedPolicy: FunderPolicyRequest = {
+      ...DEFAULT_POLICY_REQUEST,
+      requestId: uint256ToBytes(99n),
+      minAnnualRevenueKrw: 100n,
+      maxDebtRatioBps: 30000n,
+      maxOverdueCount: 5n,
+    };
+    setAttestedFinancialState(simulator, 499999999n, 25000n, 2n, { policyRequest: relaxedPolicy });
+
+    simulator.verifyEligibility(defaultPin, simulator.defaultSubject, relaxedPolicy);
+
+    const key = simulator.deriveReceivableEligibilityKey(
+      simulator.companySecretKey,
+      defaultPin,
+      simulator.defaultSubject,
+      { policyRequest: relaxedPolicy },
+    );
+    expect(simulator.getLedger().eligibilityResults.lookup(key).eligible).toBe(true);
+  });
+
+  it('rejects policy threshold, audience, request ID, or expiry tampering after provider signing', () => {
+    const mutations: FunderPolicyRequest[] = [
+      { ...DEFAULT_POLICY_REQUEST, minAnnualRevenueKrw: DEFAULT_POLICY_REQUEST.minAnnualRevenueKrw + 1n },
+      { ...DEFAULT_POLICY_REQUEST, intendedFunderWallet: evmAddressToBytes(BUYER_WALLET_HEX) },
+      { ...DEFAULT_POLICY_REQUEST, requestId: uint256ToBytes(123n) },
+      { ...DEFAULT_POLICY_REQUEST, validUntil: DEFAULT_POLICY_REQUEST.validUntil - 1n },
+    ];
+    for (const alteredPolicy of mutations) {
+      const simulator = new GasokEligibilitySimulator();
+      setAttestedFinancialState(simulator, 500000000n, 20000n, 1n);
+      expect(() => simulator.verifyEligibility(defaultPin, simulator.defaultSubject, alteredPolicy)).toThrow();
+      expect(simulator.getLedger().eligibilityResults.size()).toBe(0n);
+    }
+  });
+
+  it('binds company commitments to the request ID even if a Uint16 nonce repeats', () => {
+    const simulator = new GasokEligibilitySimulator();
+    const otherPolicy = { ...DEFAULT_POLICY_REQUEST, requestId: uint256ToBytes(2n) };
+    expect(simulator.deriveCompanyCommitment(simulator.companySecretKey, 7n, DEFAULT_POLICY_REQUEST))
+      .not.toEqual(simulator.deriveCompanyCommitment(simulator.companySecretKey, 7n, otherPolicy));
+  });
+
+  it('rejects a policy at its exact block-time expiry boundary', () => {
+    const blockTime = 2_000_000_000;
+    const simulator = new GasokEligibilitySimulator(blockTime);
+    const expiredPolicy: FunderPolicyRequest = {
+      ...DEFAULT_POLICY_REQUEST,
+      requestId: uint256ToBytes(77n),
+      validUntil: BigInt(blockTime),
+    };
+    setAttestedFinancialState(simulator, 500000000n, 20000n, 1n, { policyRequest: expiredPolicy });
+    expect(() => simulator.verifyEligibility(defaultPin, simulator.defaultSubject, expiredPolicy))
+      .toThrow('Policy request has expired');
   });
 
   it('accepts revenue values that require more than 32 bits', () => {
@@ -122,14 +185,16 @@ describe('GASOK financial eligibility contract', () => {
     expect(readResult(simulator).eligible).toBe(false);
   });
 
-  it('stores only eligible, provider ID, and policy version in the public result', () => {
+  it('stores only the outcome, provider, evaluation version, and freshness metadata publicly', () => {
     const simulator = new GasokEligibilitySimulator();
     setAttestedFinancialState(simulator, 900000000n, 15000n, 0n);
 
     const ledger = simulator.verifyEligibility(defaultPin);
     const result = readResult(simulator);
 
-    expect(Object.keys(result).sort()).toEqual(['eligible', 'policyVersion', 'providerId']);
+    expect(Object.keys(result).sort()).toEqual([
+      'eligible', 'evaluationVersion', 'profileAsOf', 'providerId', 'validUntil',
+    ]);
     expect('annualRevenueKrw' in result).toBe(false);
     expect('debtRatioBps' in result).toBe(false);
     expect('overdueCount' in result).toBe(false);
@@ -269,7 +334,7 @@ describe('GASOK financial eligibility contract', () => {
     expect(simulator.getLedger().eligibilityResults.size()).toBe(0n);
   });
 
-  it('rejects an attestation bound to a different PIN commitment', () => {
+  it('rejects an attestation bound to a different pseudonym nonce commitment', () => {
     const simulator = new GasokEligibilitySimulator();
     setAttestedFinancialState(simulator, 800000000n, 10000n, 0n, { pin: defaultPin });
 
@@ -361,7 +426,9 @@ describe('GASOK financial eligibility contract', () => {
     expect(readResult(simulator)).toEqual({
       eligible: true,
       providerId: 2n,
-      policyVersion: 1n,
+      evaluationVersion: 2n,
+      profileAsOf: 1n,
+      validUntil: 4000000000n,
     });
   });
 
@@ -370,7 +437,7 @@ describe('GASOK financial eligibility contract', () => {
     const identityProviderKey = ecMulGenerator(0n);
     const forgedResponse = 7n;
     const forgedAnnouncement = ecMulGenerator(forgedResponse);
-    const arbitraryMessage = [1n, 2n, 3n, 4n, 5n, 6n, 2n, 1n];
+    const arbitraryMessage = [1n, 2n, 3n, 4n, 5n, 6n, 7n, 2n, 2n, 1n, 4000000000n];
     const challenge = pureCircuits.schnorrChallenge(
       forgedAnnouncement.x,
       forgedAnnouncement.y,

@@ -17,9 +17,19 @@ import {
   createAuthorizationChallengeRequest,
   type AuthorizationProof,
 } from '../authorization';
+import { LocalAttestationApiError } from '../attestation-errors.js';
 
 const midnightContractAddress = '11'.repeat(32);
 const partyWallet = `0x${'22'.repeat(20)}`;
+const policyRequest = {
+  requestId: `0x${'33'.repeat(32)}`,
+  intendedFunderWallet: `0x${'44'.repeat(20)}`,
+  minAnnualRevenueKrw: 500_000_000n,
+  maxDebtRatioBps: 20_000n,
+  maxOverdueCount: 1n,
+  validUntil: 4_000_000_000n,
+};
+const policyRequestHash = bytesToHex(api.derivePolicyRequestHash(policyRequest));
 
 function validAttestationResponse() {
   return {
@@ -28,7 +38,10 @@ function validAttestationResponse() {
       response: '3',
     },
     providerId: 2,
-    policyVersion: 1,
+    evaluationVersion: 2,
+    policyRequestHash,
+    profileAsOf: '1700000000',
+    validUntil: policyRequest.validUntil.toString(),
     midnightContractAddress,
     binding: {
       giwaChainId: '91342',
@@ -38,7 +51,7 @@ function validAttestationResponse() {
       partyWallet,
     },
     attestationType: 'mock',
-    authorizationProtocol: 'eip712-role-wallet-v1',
+    authorizationProtocol: 'eip712-role-wallet-v2',
   };
 }
 
@@ -47,6 +60,8 @@ const expectedAttestationContext = {
   onchainReceivableId: 42n,
   subjectRole: 'SELLER' as const,
   giwa: getDefaultGiwaDeploymentConfig(),
+  policyRequest,
+  profileAsOf: 1_700_000_000n,
 };
 
 const authorizationRequest = createAuthorizationChallengeRequest(
@@ -55,11 +70,12 @@ const authorizationRequest = createAuthorizationChallengeRequest(
   1n,
   123n,
   expectedAttestationContext,
+  policyRequest,
   `0x${'aa'.repeat(32)}`,
 );
 
 const authorizationProof: AuthorizationProof = {
-  version: 1,
+  version: 2,
   authorizationId: `0x${'bb'.repeat(32)}`,
   typedDataHash: `0x${'cc'.repeat(32)}`,
   signer: partyWallet,
@@ -105,7 +121,11 @@ describe('GIWA CLI binding helpers', () => {
 
   it('derives different opaque lookup keys for different receivables and roles', () => {
     const giwa = getDefaultGiwaDeploymentConfig();
-    const companyCommitment = api.deriveCompanyCommitment(Uint8Array.from({ length: 32 }, (_, index) => index), 1234n);
+    const companyCommitment = api.deriveCompanyCommitment(
+      Uint8Array.from({ length: 32 }, (_, index) => index),
+      1234n,
+      policyRequest.requestId,
+    );
     const deploymentHash = api.deriveMidnightDeploymentHash(midnightContractAddress);
     const sellerSubject = {
       receivableId: receivableIdToBytes(42n),
@@ -119,16 +139,19 @@ describe('GIWA CLI binding helpers', () => {
       companyCommitment,
       api.deriveGiwaReceivableBindingHash(giwa, sellerSubject),
       deploymentHash,
+      api.derivePolicyRequestHash(policyRequest),
     );
     const buyerKey = api.deriveReceivableEligibilityKey(
       companyCommitment,
       api.deriveGiwaReceivableBindingHash(giwa, buyerSubject),
       deploymentHash,
+      api.derivePolicyRequestHash(policyRequest),
     );
     const anotherReceivableKey = api.deriveReceivableEligibilityKey(
       companyCommitment,
       api.deriveGiwaReceivableBindingHash(giwa, anotherReceivable),
       deploymentHash,
+      api.derivePolicyRequestHash(policyRequest),
     );
 
     expect(bytesToHex(sellerKey)).not.toBe(bytesToHex(buyerKey));
@@ -165,7 +188,7 @@ describe('GIWA CLI binding helpers', () => {
       expect(request?.redirect).toBe('error');
       expect(request?.signal).toBeInstanceOf(AbortSignal);
       expect(JSON.parse(String(request?.body))).toEqual({
-        version: 1,
+        version: 2,
         annualRevenueKrw: '500000000',
         debtRatioBps: '20000',
         overdueCount: '1',
@@ -174,6 +197,14 @@ describe('GIWA CLI binding helpers', () => {
         midnightContractAddress,
         onchainReceivableId: '42',
         subjectRole: 'SELLER',
+        policyRequest: {
+          requestId: policyRequest.requestId,
+          intendedFunderWallet: policyRequest.intendedFunderWallet,
+          minAnnualRevenueKrw: policyRequest.minAnnualRevenueKrw.toString(),
+          maxDebtRatioBps: policyRequest.maxDebtRatioBps.toString(),
+          maxOverdueCount: policyRequest.maxOverdueCount.toString(),
+          validUntil: policyRequest.validUntil.toString(),
+        },
         authorization: authorizationProof,
       });
       expect(attestation.providerId).toBe(2n);
@@ -280,6 +311,97 @@ describe('GIWA CLI binding helpers', () => {
     const request = fetchTestAttestation('http://localhost:4000');
     await expect(request).rejects.toThrow('Mock Attestation API returned HTTP 500.');
     await expect(request).rejects.not.toThrow(secretMarker);
+  });
+
+  it.each([
+    [404, 'GIWA_RECEIVABLE_NOT_FOUND'],
+    [502, 'GIWA_RPC_UNAVAILABLE'],
+  ] as const)(
+    'preserves the safe challenge HTTP %i %s code without reflecting the Provider message',
+    async (status, code) => {
+      const privateMarker = 'annualRevenueKrw=500000000 secretPin=1234';
+      vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+        new Response(JSON.stringify({ error: { code, message: privateMarker } }), { status }),
+      );
+
+      let caught: unknown;
+      try {
+        await api.fetchAuthorizationChallenge(
+          'http://localhost:4000',
+          authorizationRequest,
+          expectedAttestationContext,
+        );
+      } catch (error: unknown) {
+        caught = error;
+      }
+
+      expect(caught).toBeInstanceOf(LocalAttestationApiError);
+      expect(caught).toMatchObject({ code, status });
+      expect((caught as Error).message).not.toContain(privateMarker);
+    },
+  );
+
+  it('preserves a safe role-wallet mismatch from attestation without reflecting the Provider message', async () => {
+    const privateMarker = 'authorization signer and private tuple must not leak';
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          error: { code: 'ROLE_WALLET_MISMATCH', message: privateMarker },
+        }),
+        { status: 403 },
+      ),
+    );
+
+    let caught: unknown;
+    try {
+      await fetchTestAttestation('http://localhost:4000');
+    } catch (error: unknown) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(LocalAttestationApiError);
+    expect(caught).toMatchObject({ code: 'ROLE_WALLET_MISMATCH', status: 403 });
+    expect((caught as Error).message).not.toContain(privateMarker);
+  });
+
+  it('preserves a safe expired-policy failure from attestation without reflecting the Provider message', async () => {
+    const privateMarker = 'expired request details and private tuple must not leak';
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          error: { code: 'POLICY_REQUEST_EXPIRED', message: privateMarker },
+        }),
+        { status: 409 },
+      ),
+    );
+
+    let caught: unknown;
+    try {
+      await fetchTestAttestation('http://localhost:4000');
+    } catch (error: unknown) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(LocalAttestationApiError);
+    expect(caught).toMatchObject({ code: 'POLICY_REQUEST_EXPIRED', status: 409 });
+    expect((caught as Error).message).toBe('The Funder policy request has expired.');
+    expect((caught as Error).message).not.toContain(privateMarker);
+  });
+
+  it('keeps a mismatched Provider code/status envelope generic and non-reflective', async () => {
+    const privateMarker = 'provider-internal-details';
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          error: { code: 'GIWA_RECEIVABLE_NOT_FOUND', message: privateMarker },
+        }),
+        { status: 500 },
+      ),
+    );
+
+    const request = fetchTestAttestation('http://localhost:4000');
+    await expect(request).rejects.toThrow('Mock Attestation API returned HTTP 500.');
+    await expect(request).rejects.not.toThrow(privateMarker);
   });
 
   it('does not echo a malformed success response body', async () => {

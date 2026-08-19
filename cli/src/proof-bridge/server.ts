@@ -3,23 +3,29 @@
 
 import * as http from 'node:http';
 import type { AuthorizationProof } from '../authorization.js';
+import { LocalAttestationApiError } from '../attestation-errors.js';
 import { UINT16_MAX, UINT32_MAX, UINT64_MAX, UINT256_MAX, type SubjectRole } from '../giwa.js';
 import { ProofSessionStoreError } from './session-store.js';
+import { CapabilityOutboxError } from './capability-outbox.js';
 import {
   PROOF_BRIDGE_MAX_BODY_BYTES,
   type ParsedProofChallengeInput,
   type ProofBridgeErrorResponse,
   type ProofChallengeRequest,
+  type ProofAcknowledgementRequest,
+  type ProofRecoveryRequest,
   type ProofSessionRequest,
   type ProofSubmissionRequest,
 } from './types.js';
 import type { ProofBridgeController } from './runtime.js';
 
-const CHALLENGE_PATH = '/v1/proof-sessions/challenge';
-const PROVE_PATH = '/v1/proof-sessions/prove';
-const STATUS_PATH = '/v1/proof-sessions/status';
-const CANCEL_PATH = '/v1/proof-sessions/cancel';
-const PROTECTED_PATHS = new Set([CHALLENGE_PATH, PROVE_PATH, STATUS_PATH, CANCEL_PATH]);
+const CHALLENGE_PATH = '/v2/proof-sessions/challenge';
+const PROVE_PATH = '/v2/proof-sessions/prove';
+const STATUS_PATH = '/v2/proof-sessions/status';
+const CANCEL_PATH = '/v2/proof-sessions/cancel';
+const RECOVER_PATH = '/v2/proof-sessions/recover';
+const ACK_PATH = '/v2/proof-sessions/ack';
+const PROTECTED_PATHS = new Set([CHALLENGE_PATH, PROVE_PATH, STATUS_PATH, CANCEL_PATH, RECOVER_PATH, ACK_PATH]);
 const SESSION_ID_PATTERN = /^0x[0-9a-f]{64}$/;
 const BYTES32_PATTERN = /^0x[0-9a-fA-F]{64}$/;
 const EVM_ADDRESS_PATTERN = /^0x[0-9a-fA-F]{40}$/;
@@ -31,11 +37,21 @@ const CHALLENGE_KEYS = [
   'debtRatioBps',
   'onchainReceivableId',
   'overdueCount',
-  'secretPin',
+  'policyRequest',
   'subjectRole',
   'version',
 ] as const;
+const POLICY_REQUEST_KEYS = [
+  'requestId',
+  'intendedFunderWallet',
+  'minAnnualRevenueKrw',
+  'maxDebtRatioBps',
+  'maxOverdueCount',
+  'validUntil',
+] as const;
 const SESSION_KEYS = ['sessionId', 'version'] as const;
+const RECOVER_KEYS = ['requestId', 'version'] as const;
+const ACK_KEYS = ['requestId', 'sessionId', 'version'] as const;
 const PROVE_KEYS = ['authorization', 'sessionId', 'version'] as const;
 const AUTHORIZATION_KEYS = ['authorizationId', 'signature', 'signer', 'typedDataHash', 'version'] as const;
 
@@ -97,9 +113,27 @@ function parseSubjectRole(value: unknown): SubjectRole {
   return value;
 }
 
-export function parseChallengeRequest(value: unknown): ParsedProofChallengeInput {
+export function parseChallengeRequest(
+  value: unknown,
+  nowSeconds: bigint = BigInt(Math.floor(Date.now() / 1_000)),
+): ParsedProofChallengeInput {
   const body = requireExactRecord(value, CHALLENGE_KEYS) as unknown as ProofChallengeRequest;
-  if (body.version !== 1) {
+  if (body.version !== 2) {
+    throw invalidRequest();
+  }
+  const policyRequest = requireExactRecord(body.policyRequest, POLICY_REQUEST_KEYS);
+  if (
+    typeof policyRequest.requestId !== 'string' ||
+    !SESSION_ID_PATTERN.test(policyRequest.requestId) ||
+    policyRequest.requestId === ZERO_BYTES32 ||
+    typeof policyRequest.intendedFunderWallet !== 'string' ||
+    !/^0x[0-9a-f]{40}$/.test(policyRequest.intendedFunderWallet) ||
+    policyRequest.intendedFunderWallet === ZERO_ADDRESS
+  ) {
+    throw invalidRequest();
+  }
+  const validUntil = parseCanonicalUnsigned(policyRequest.validUntil, UINT64_MAX, true);
+  if (validUntil <= nowSeconds) {
     throw invalidRequest();
   }
   return Object.freeze({
@@ -108,27 +142,63 @@ export function parseChallengeRequest(value: unknown): ParsedProofChallengeInput
     annualRevenueKrw: parseCanonicalUnsigned(body.annualRevenueKrw, UINT64_MAX),
     debtRatioBps: parseCanonicalUnsigned(body.debtRatioBps, UINT32_MAX),
     overdueCount: parseCanonicalUnsigned(body.overdueCount, UINT16_MAX),
-    secretPin: parseCanonicalUnsigned(body.secretPin, UINT16_MAX),
+    policyRequest: Object.freeze({
+      requestId: policyRequest.requestId,
+      intendedFunderWallet: policyRequest.intendedFunderWallet,
+      minAnnualRevenueKrw: parseCanonicalUnsigned(policyRequest.minAnnualRevenueKrw, UINT64_MAX),
+      maxDebtRatioBps: parseCanonicalUnsigned(policyRequest.maxDebtRatioBps, UINT32_MAX),
+      maxOverdueCount: parseCanonicalUnsigned(policyRequest.maxOverdueCount, UINT16_MAX),
+      validUntil,
+    }),
   });
 }
 
 export function parseSessionRequest(value: unknown): ProofSessionRequest {
   const body = requireExactRecord(value, SESSION_KEYS);
   if (
-    body.version !== 1 ||
+    body.version !== 2 ||
     typeof body.sessionId !== 'string' ||
     !SESSION_ID_PATTERN.test(body.sessionId) ||
     body.sessionId === ZERO_BYTES32
   ) {
     throw invalidRequest();
   }
-  return { version: 1, sessionId: body.sessionId };
+  return { version: 2, sessionId: body.sessionId };
+}
+
+export function parseRecoveryRequest(value: unknown): ProofRecoveryRequest {
+  const body = requireExactRecord(value, RECOVER_KEYS);
+  if (
+    body.version !== 2 ||
+    typeof body.requestId !== 'string' ||
+    !SESSION_ID_PATTERN.test(body.requestId) ||
+    body.requestId === ZERO_BYTES32
+  ) {
+    throw invalidRequest();
+  }
+  return { version: 2, requestId: body.requestId };
+}
+
+export function parseAcknowledgementRequest(value: unknown): ProofAcknowledgementRequest {
+  const body = requireExactRecord(value, ACK_KEYS);
+  if (
+    body.version !== 2 ||
+    typeof body.requestId !== 'string' ||
+    !SESSION_ID_PATTERN.test(body.requestId) ||
+    body.requestId === ZERO_BYTES32 ||
+    typeof body.sessionId !== 'string' ||
+    !SESSION_ID_PATTERN.test(body.sessionId) ||
+    body.sessionId === ZERO_BYTES32
+  ) {
+    throw invalidRequest();
+  }
+  return { version: 2, requestId: body.requestId, sessionId: body.sessionId };
 }
 
 export function parseProofSubmissionRequest(value: unknown): ProofSubmissionRequest {
   const body = requireExactRecord(value, PROVE_KEYS);
   if (
-    body.version !== 1 ||
+    body.version !== 2 ||
     typeof body.sessionId !== 'string' ||
     !SESSION_ID_PATTERN.test(body.sessionId) ||
     body.sessionId === ZERO_BYTES32
@@ -137,7 +207,7 @@ export function parseProofSubmissionRequest(value: unknown): ProofSubmissionRequ
   }
   const proof = requireExactRecord(body.authorization, AUTHORIZATION_KEYS);
   if (
-    proof.version !== 1 ||
+    proof.version !== 2 ||
     typeof proof.authorizationId !== 'string' ||
     !BYTES32_PATTERN.test(proof.authorizationId) ||
     proof.authorizationId.toLowerCase() === ZERO_BYTES32 ||
@@ -153,13 +223,13 @@ export function parseProofSubmissionRequest(value: unknown): ProofSubmissionRequ
     throw invalidRequest();
   }
   const authorization: AuthorizationProof = {
-    version: 1,
+    version: 2,
     authorizationId: proof.authorizationId,
     typedDataHash: proof.typedDataHash,
     signer: proof.signer,
     signature: proof.signature,
   };
-  return { version: 1, sessionId: body.sessionId, authorization };
+  return { version: 2, sessionId: body.sessionId, authorization };
 }
 
 function setSecurityHeaders(response: http.ServerResponse): void {
@@ -194,6 +264,20 @@ function mapError(error: unknown): ProofBridgeHttpError {
   if (error instanceof ProofSessionStoreError) {
     const status = error.code === 'PROOF_SESSION_NOT_FOUND' ? 404 : error.code === 'PROOF_SESSION_BUSY' ? 409 : 409;
     return new ProofBridgeHttpError(status, error.code, error.message);
+  }
+  if (error instanceof CapabilityOutboxError) {
+    const status =
+      error.code === 'PROOF_RESULT_NOT_FOUND'
+        ? 404
+        : error.code === 'POLICY_REQUEST_EXPIRED'
+          ? 410
+          : error.code.startsWith('PROOF_RESULT_')
+            ? 409
+            : 503;
+    return new ProofBridgeHttpError(status, error.code, error.publicMessage);
+  }
+  if (error instanceof LocalAttestationApiError) {
+    return new ProofBridgeHttpError(error.status, error.code, error.publicMessage);
   }
   return new ProofBridgeHttpError(502, 'PROOF_BRIDGE_UNAVAILABLE', 'The local Midnight proof service is unavailable.');
 }
@@ -281,7 +365,17 @@ export function createProofBridgeServer(options: ProofBridgeServerOptions): http
         }
         if (path === PROVE_PATH) {
           const parsed = parseProofSubmissionRequest(body);
-          sendJson(response, 202, options.controller.startProof(parsed.sessionId, parsed.authorization));
+          sendJson(response, 202, await options.controller.startProof(parsed.sessionId, parsed.authorization));
+          return;
+        }
+        if (path === RECOVER_PATH) {
+          const parsed = parseRecoveryRequest(body);
+          sendJson(response, 200, options.controller.recover(parsed.requestId));
+          return;
+        }
+        if (path === ACK_PATH) {
+          const parsed = parseAcknowledgementRequest(body);
+          sendJson(response, 200, await options.controller.acknowledge(parsed.sessionId, parsed.requestId));
           return;
         }
         const parsed = parseSessionRequest(body);
@@ -290,7 +384,7 @@ export function createProofBridgeServer(options: ProofBridgeServerOptions): http
           200,
           path === STATUS_PATH
             ? options.controller.getStatus(parsed.sessionId)
-            : options.controller.cancel(parsed.sessionId),
+            : await options.controller.cancel(parsed.sessionId),
         );
       } catch (error: unknown) {
         request.resume();

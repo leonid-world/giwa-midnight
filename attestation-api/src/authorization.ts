@@ -20,15 +20,16 @@ import type {
 } from './types.js';
 
 export const PROVIDER_ID = 2;
-export const POLICY_VERSION = 1;
-export const AUTHORIZATION_PROTOCOL = 'eip712-role-wallet-v1' as const;
-export const AUTHORIZATION_VERSION = 1 as const;
+export const EVALUATION_VERSION = 2 as const;
+export const AUTHORIZATION_PROTOCOL = 'eip712-role-wallet-v2' as const;
+export const AUTHORIZATION_VERSION = 2 as const;
 export const AUTHORIZATION_TTL_SECONDS = 120;
 export const MAX_PENDING_AUTHORIZATIONS = 128;
 export const AUTHORIZATION_PRIMARY_TYPE = 'GASOKRoleAttestationAuthorization' as const;
-export const AUTHORIZATION_PURPOSE = 'Authorize GASOK local mock financial attestation' as const;
+export const AUTHORIZATION_PURPOSE =
+  'Authorize GASOK local mock financial attestation for a Funder policy request' as const;
 
-const ATTESTATION_REQUEST_DOMAIN = id('gasok:mock-attestation-request:v1');
+const ATTESTATION_REQUEST_DOMAIN = id('gasok:mock-attestation-request:v2');
 const abiCoder = AbiCoder.defaultAbiCoder();
 const BYTES32_PATTERN = /^0x[0-9a-fA-F]{64}$/;
 const SIGNATURE_PATTERN = /^0x[0-9a-fA-F]{130}$/;
@@ -36,7 +37,7 @@ const ZERO_BYTES32 = `0x${'0'.repeat(64)}`;
 
 export const AUTHORIZATION_DOMAIN: AuthorizationDomain = Object.freeze({
   name: 'GASOK Mock Attestation',
-  version: '1',
+  version: '2',
   chainId: GIWA_CHAIN_ID.toString(),
 });
 
@@ -48,9 +49,16 @@ export const AUTHORIZATION_FIELDS = Object.freeze([
   Object.freeze({ name: 'onchainReceivableId', type: 'uint256' }),
   Object.freeze({ name: 'subjectRole', type: 'string' }),
   Object.freeze({ name: 'partyWallet', type: 'address' }),
+  Object.freeze({ name: 'requestId', type: 'bytes32' }),
+  Object.freeze({ name: 'intendedFunderWallet', type: 'address' }),
+  Object.freeze({ name: 'minAnnualRevenueKrw', type: 'uint64' }),
+  Object.freeze({ name: 'maxDebtRatioBps', type: 'uint32' }),
+  Object.freeze({ name: 'maxOverdueCount', type: 'uint16' }),
   Object.freeze({ name: 'attestationRequestCommitment', type: 'bytes32' }),
   Object.freeze({ name: 'providerId', type: 'uint16' }),
-  Object.freeze({ name: 'policyVersion', type: 'uint16' }),
+  Object.freeze({ name: 'evaluationVersion', type: 'uint16' }),
+  Object.freeze({ name: 'profileAsOf', type: 'uint64' }),
+  Object.freeze({ name: 'policyValidUntil', type: 'uint64' }),
   Object.freeze({ name: 'issuedAt', type: 'uint64' }),
   Object.freeze({ name: 'expiresAt', type: 'uint64' }),
 ]);
@@ -85,6 +93,20 @@ export class AuthorizationValidationError extends Error {
   constructor() {
     super('The wallet authorization is invalid or no longer available.');
     this.name = 'AuthorizationValidationError';
+  }
+}
+
+export class RoleWalletMismatchError extends AuthorizationValidationError {
+  constructor() {
+    super();
+    this.name = 'RoleWalletMismatchError';
+  }
+}
+
+export class PolicyRequestExpiredError extends AuthorizationValidationError {
+  constructor() {
+    super();
+    this.name = 'PolicyRequestExpiredError';
   }
 }
 
@@ -134,8 +156,12 @@ export class AuthorizationChallengeStore {
     this.#ttlSeconds = options.ttlSeconds ?? AUTHORIZATION_TTL_SECONDS;
     this.#maxEntries = options.maxEntries ?? MAX_PENDING_AUTHORIZATIONS;
 
-    if (!Number.isSafeInteger(this.#ttlSeconds) || this.#ttlSeconds <= 0) {
-      throw new RangeError('Authorization TTL must be a positive integer');
+    if (
+      !Number.isSafeInteger(this.#ttlSeconds) ||
+      this.#ttlSeconds <= 0 ||
+      this.#ttlSeconds > AUTHORIZATION_TTL_SECONDS
+    ) {
+      throw new RangeError(`Authorization TTL must be between 1 and ${AUTHORIZATION_TTL_SECONDS} seconds`);
     }
     if (!Number.isSafeInteger(this.#maxEntries) || this.#maxEntries <= 0) {
       throw new RangeError('Authorization capacity must be a positive integer');
@@ -212,11 +238,20 @@ export class AuthorizationChallengeStore {
     this.#pruneExpired(this.#now());
     return this.#records.size;
   }
+
+  currentUnixSeconds(): bigint {
+    const now = this.#now();
+    if (!Number.isSafeInteger(now) || now < 0) {
+      throw new RangeError('Authorization clock must return non-negative Unix seconds');
+    }
+    return BigInt(now);
+  }
 }
 
 export function buildAttestationRequestCommitment(
   request: ParsedAttestationRequest,
   partyWallet: string,
+  profileAsOf: string,
 ): string {
   const encoded = abiCoder.encode(
     [
@@ -234,6 +269,13 @@ export function buildAttestationRequestCommitment(
       'uint16',
       'uint16',
       'bytes32',
+      'address',
+      'uint64',
+      'uint32',
+      'uint16',
+      'uint64',
+      'uint64',
+      'bytes32',
     ],
     [
       ATTESTATION_REQUEST_DOMAIN,
@@ -248,7 +290,14 @@ export function buildAttestationRequestCommitment(
       request.subjectRole,
       partyWallet,
       PROVIDER_ID,
-      POLICY_VERSION,
+      EVALUATION_VERSION,
+      request.policyRequest.requestId,
+      request.policyRequest.intendedFunderWallet,
+      request.policyRequest.minAnnualRevenueKrw,
+      request.policyRequest.maxDebtRatioBps,
+      request.policyRequest.maxOverdueCount,
+      profileAsOf,
+      request.policyRequest.validUntil,
       request.authorizationSalt,
     ],
   );
@@ -262,6 +311,21 @@ export function buildAuthorizationMessage(
   issuedAt: string,
   expiresAt: string,
 ): AuthorizationMessage {
+  const issuedAtSeconds = BigInt(issuedAt);
+  const requestedExpiresAt = BigInt(expiresAt);
+  const policyValidUntil = BigInt(request.policyRequest.validUntil);
+  if (policyValidUntil <= issuedAtSeconds) {
+    throw new PolicyRequestExpiredError();
+  }
+  if (
+    requestedExpiresAt <= issuedAtSeconds ||
+    requestedExpiresAt - issuedAtSeconds > BigInt(AUTHORIZATION_TTL_SECONDS)
+  ) {
+    throw new RangeError(`Authorization TTL must be between 1 and ${AUTHORIZATION_TTL_SECONDS} seconds`);
+  }
+  const boundedExpiresAt = requestedExpiresAt < policyValidUntil
+    ? requestedExpiresAt
+    : policyValidUntil;
   return Object.freeze({
     purpose: AUTHORIZATION_PURPOSE,
     authorizationId: normalizeBytes32(authorizationId),
@@ -270,11 +334,18 @@ export function buildAuthorizationMessage(
     onchainReceivableId: request.onchainReceivableId.toString(),
     subjectRole: request.subjectRole,
     partyWallet: getAddress(partyWallet).toLowerCase(),
-    attestationRequestCommitment: buildAttestationRequestCommitment(request, partyWallet),
+    requestId: request.policyRequest.requestId,
+    intendedFunderWallet: request.policyRequest.intendedFunderWallet,
+    minAnnualRevenueKrw: request.policyRequest.minAnnualRevenueKrw.toString(),
+    maxDebtRatioBps: request.policyRequest.maxDebtRatioBps.toString(),
+    maxOverdueCount: request.policyRequest.maxOverdueCount.toString(),
+    attestationRequestCommitment: buildAttestationRequestCommitment(request, partyWallet, issuedAt),
     providerId: PROVIDER_ID.toString(),
-    policyVersion: POLICY_VERSION.toString(),
+    evaluationVersion: EVALUATION_VERSION.toString(),
+    profileAsOf: issuedAt,
+    policyValidUntil: request.policyRequest.validUntil.toString(),
     issuedAt,
-    expiresAt,
+    expiresAt: boundedExpiresAt.toString(),
   });
 }
 
@@ -328,7 +399,11 @@ export function verifyAuthorizationSignature(
     throw new AuthorizationValidationError();
   }
 
-  if (signer !== canonical || recovered !== canonical || recovered !== signer) {
-    throw new AuthorizationValidationError();
+  // Reaching this comparison means both the declared signer and the recovered
+  // signer were syntactically valid and the EIP-712 signature was recoverable.
+  // Only this semantic mismatch with the current canonical GIWA role wallet is
+  // safe to distinguish from a malformed or otherwise invalid authorization.
+  if (signer !== canonical || recovered !== canonical) {
+    throw new RoleWalletMismatchError();
   }
 }

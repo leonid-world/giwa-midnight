@@ -1,25 +1,35 @@
 export type SubjectRole = 'SELLER' | 'BUYER';
 
-export type AuthorizationProtocol = 'eip712-role-wallet-v1';
+export type AuthorizationProtocol = 'eip712-role-wallet-v2';
+
+export interface FunderPolicyRequestWire {
+  readonly requestId: string;
+  readonly intendedFunderWallet: string;
+  readonly minAnnualRevenueKrw: string;
+  readonly maxDebtRatioBps: string;
+  readonly maxOverdueCount: string;
+  readonly validUntil: string;
+}
 
 export interface AuthorizationChallengeRequest {
-  version: 1;
-  annualRevenueKrw: string;
-  debtRatioBps: string;
-  overdueCount: string;
-  companyCommitmentHash: string;
-  authorizationSalt: string;
-  midnightContractAddress: string;
-  onchainReceivableId: string;
-  subjectRole: SubjectRole;
+  readonly version: 2;
+  readonly annualRevenueKrw: string;
+  readonly debtRatioBps: string;
+  readonly overdueCount: string;
+  readonly companyCommitmentHash: string;
+  readonly authorizationSalt: string;
+  readonly midnightContractAddress: string;
+  readonly onchainReceivableId: string;
+  readonly subjectRole: SubjectRole;
+  readonly policyRequest: FunderPolicyRequestWire;
 }
 
 export interface AuthorizationProof {
-  version: 1;
-  authorizationId: string;
-  typedDataHash: string;
-  signer: string;
-  signature: string;
+  readonly version: 2;
+  readonly authorizationId: string;
+  readonly typedDataHash: string;
+  readonly signer: string;
+  readonly signature: string;
 }
 
 export interface AttestationRequest extends AuthorizationChallengeRequest {
@@ -35,11 +45,19 @@ export interface ParsedAttestationRequest {
   readonly midnightContractAddress: string;
   readonly onchainReceivableId: bigint;
   readonly subjectRole: SubjectRole;
+  readonly policyRequest: {
+    readonly requestId: string;
+    readonly intendedFunderWallet: string;
+    readonly minAnnualRevenueKrw: bigint;
+    readonly maxDebtRatioBps: bigint;
+    readonly maxOverdueCount: bigint;
+    readonly validUntil: bigint;
+  };
 }
 
 export interface AuthorizationDomain {
   readonly name: 'GASOK Mock Attestation';
-  readonly version: '1';
+  readonly version: '2';
   readonly chainId: string;
 }
 
@@ -60,15 +78,22 @@ export interface AuthorizationMessage {
   readonly onchainReceivableId: string;
   readonly subjectRole: SubjectRole;
   readonly partyWallet: string;
+  readonly requestId: string;
+  readonly intendedFunderWallet: string;
+  readonly minAnnualRevenueKrw: string;
+  readonly maxDebtRatioBps: string;
+  readonly maxOverdueCount: string;
   readonly attestationRequestCommitment: string;
   readonly providerId: string;
-  readonly policyVersion: string;
+  readonly evaluationVersion: string;
+  readonly profileAsOf: string;
+  readonly policyValidUntil: string;
   readonly issuedAt: string;
   readonly expiresAt: string;
 }
 
 export interface AuthorizationChallengeResponse {
-  readonly version: 1;
+  readonly version: 2;
   readonly domain: AuthorizationDomain;
   readonly primaryType: 'GASOKRoleAttestationAuthorization';
   readonly types: AuthorizationTypes;
@@ -89,7 +114,10 @@ export interface AttestationResponse {
     response: string;
   };
   providerId: number;
-  policyVersion: number;
+  evaluationVersion: 2;
+  policyRequestHash: string;
+  profileAsOf: string;
+  validUntil: string;
   midnightContractAddress: string;
   binding: GiwaReceivableBinding;
   attestationType: 'mock';

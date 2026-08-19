@@ -19,11 +19,24 @@ import {
   type AuthorizationChallengeRequest,
 } from '../authorization.js';
 import type { DeployedGasokEligibilityContract, GasokEligibilityProviders } from '../common-types.js';
-import { getDefaultGiwaDeploymentConfig } from '../giwa.js';
+import { bytesToHex, getDefaultGiwaDeploymentConfig } from '../giwa.js';
+import {
+  ELIGIBILITY_RESULT_ALREADY_EXISTS_CODE,
+  ELIGIBILITY_RESULT_ALREADY_EXISTS_MESSAGE,
+  EligibilityResultAlreadyExistsError,
+} from '../proof-errors.js';
 import { getInitialPrivateState } from '../state.utils.js';
 
-const CONTRACT_ADDRESS = '7e3ea9d741ce0f5862db6f46d0ad720be2586cd7d0405ec77e4a0478aa50f4fb';
+const CONTRACT_ADDRESS = '12caaf76aef1de1c584b67462018810f6e4e7eb2535e136f560cb621e24a3f36';
 const RECEIVABLE_FINANCE = '0x0f264334f98ba0d22f7fc6bb901a5fa36158a315';
+const POLICY_REQUEST = {
+  requestId: `0x${'3'.repeat(64)}`,
+  intendedFunderWallet: `0x${'4'.repeat(40)}`,
+  minAnnualRevenueKrw: 500_000_000n,
+  maxDebtRatioBps: 20_000n,
+  maxOverdueCount: 1n,
+  validUntil: 4_000_000_000n,
+};
 const signingTypes = {
   [AUTHORIZATION_PRIMARY_TYPE]: AUTHORIZATION_FIELDS.map((field) => ({ ...field })),
 };
@@ -41,7 +54,7 @@ interface Fixture {
 function rawChallenge(request: AuthorizationChallengeRequest, partyWallet: string): AuthorizationChallenge {
   const issuedAt = BigInt(Math.floor(Date.now() / 1_000));
   return {
-    version: 1,
+    version: 2,
     domain: AUTHORIZATION_DOMAIN,
     primaryType: AUTHORIZATION_PRIMARY_TYPE,
     types: { [AUTHORIZATION_PRIMARY_TYPE]: AUTHORIZATION_FIELDS },
@@ -53,9 +66,16 @@ function rawChallenge(request: AuthorizationChallengeRequest, partyWallet: strin
       onchainReceivableId: request.onchainReceivableId,
       subjectRole: request.subjectRole,
       partyWallet,
-      attestationRequestCommitment: buildAttestationRequestCommitment(request, partyWallet),
+      requestId: request.policyRequest.requestId,
+      intendedFunderWallet: request.policyRequest.intendedFunderWallet,
+      minAnnualRevenueKrw: request.policyRequest.minAnnualRevenueKrw,
+      maxDebtRatioBps: request.policyRequest.maxDebtRatioBps,
+      maxOverdueCount: request.policyRequest.maxOverdueCount,
+      attestationRequestCommitment: buildAttestationRequestCommitment(request, partyWallet, issuedAt.toString()),
       providerId: '2',
-      policyVersion: '1',
+      evaluationVersion: '2',
+      profileAsOf: issuedAt.toString(),
+      policyValidUntil: request.policyRequest.validUntil,
       issuedAt: issuedAt.toString(),
       expiresAt: (issuedAt + AUTHORIZATION_TTL_SECONDS).toString(),
     },
@@ -63,7 +83,7 @@ function rawChallenge(request: AuthorizationChallengeRequest, partyWallet: strin
 }
 
 function createFixture(
-  options: { circuitFailure?: Error; witnessWriteFailure?: Error; cleanupWriteFailure?: Error } = {},
+  options: { circuitFailure?: unknown; witnessWriteFailure?: Error; cleanupWriteFailure?: Error } = {},
 ): Fixture {
   const signer = Wallet.createRandom();
   const partyWallet = signer.address.toLowerCase();
@@ -107,7 +127,7 @@ function createFixture(
   const authorize = vi.fn(async (challenge: AuthorizationChallenge) => {
     const signature = await signer.signTypedData(challenge.domain, signingTypes, challenge.message);
     return {
-      version: 1,
+      version: 2,
       authorizationId: challenge.message.authorizationId,
       typedDataHash: hashAuthorizationChallenge(challenge),
       signer: partyWallet,
@@ -115,11 +135,15 @@ function createFixture(
     };
   });
 
+  let issuedProfileAsOf = '0';
+
   vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
     const endpoint = String(input);
     const request = JSON.parse(String(init?.body)) as AuthorizationChallengeRequest;
     if (endpoint.endsWith('/authorization-challenges')) {
-      return new Response(JSON.stringify(rawChallenge(request, partyWallet)), { status: 201 });
+      const challenge = rawChallenge(request, partyWallet);
+      issuedProfileAsOf = challenge.message.profileAsOf;
+      return new Response(JSON.stringify(challenge), { status: 201 });
     }
     if (endpoint.endsWith('/attest')) {
       return new Response(
@@ -129,7 +153,17 @@ function createFixture(
             response: '3',
           },
           providerId: 2,
-          policyVersion: 1,
+          evaluationVersion: 2,
+          policyRequestHash: bytesToHex(api.derivePolicyRequestHash({
+            requestId: request.policyRequest.requestId,
+            intendedFunderWallet: request.policyRequest.intendedFunderWallet,
+            minAnnualRevenueKrw: BigInt(request.policyRequest.minAnnualRevenueKrw),
+            maxDebtRatioBps: BigInt(request.policyRequest.maxDebtRatioBps),
+            maxOverdueCount: BigInt(request.policyRequest.maxOverdueCount),
+            validUntil: BigInt(request.policyRequest.validUntil),
+          })),
+          profileAsOf: issuedProfileAsOf,
+          validUntil: request.policyRequest.validUntil,
           midnightContractAddress: CONTRACT_ADDRESS,
           binding: {
             giwaChainId: '91342',
@@ -139,7 +173,7 @@ function createFixture(
             partyWallet,
           },
           attestationType: 'mock',
-          authorizationProtocol: 'eip712-role-wallet-v1',
+          authorizationProtocol: 'eip712-role-wallet-v2',
         }),
         { status: 200 },
       );
@@ -199,6 +233,7 @@ describe('split eligibility proof lifecycle', () => {
       20_000n,
       1n,
       1234n,
+      POLICY_REQUEST,
       'http://127.0.0.1:4000',
     );
 
@@ -218,6 +253,7 @@ describe('split eligibility proof lifecycle', () => {
       20_000n,
       1n,
       1234n,
+      POLICY_REQUEST,
       'http://127.0.0.1:4000',
       fixture.authorize,
     );
@@ -250,6 +286,7 @@ describe('split eligibility proof lifecycle', () => {
         20_001n,
         2n,
         4321n,
+        POLICY_REQUEST,
         'http://127.0.0.1:4000',
         fixture.authorize,
       ),
@@ -259,6 +296,77 @@ describe('split eligibility proof lifecycle', () => {
     expect(fixture.writes[0].attestationProviderId).toBe(2n);
     expectSanitized(fixture.writes[1]);
     expectSanitized(fixture.getState());
+  });
+
+  it.each([
+    new Error('Eligibility result already exists'),
+    new Error(
+      "Unexpected error executing scoped transaction '<unnamed>': Error: failed assert: Eligibility result already exists",
+      {
+        cause: Object.assign(new Error('failed assert: Eligibility result already exists'), { name: 'CompactError' }),
+      },
+    ),
+  ])('classifies only the exact duplicate-result assertion from callTx', async (circuitFailure) => {
+    const fixture = createFixture({ circuitFailure });
+
+    let thrown: unknown;
+    try {
+      await api.verifyEligibility(
+        fixture.contract,
+        fixture.providers,
+        2n,
+        'SELLER',
+        500_000_000n,
+        20_000n,
+        1n,
+        4321n,
+        POLICY_REQUEST,
+        'http://127.0.0.1:4000',
+        fixture.authorize,
+      );
+    } catch (error: unknown) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(EligibilityResultAlreadyExistsError);
+    expect(thrown).toMatchObject({
+      code: ELIGIBILITY_RESULT_ALREADY_EXISTS_CODE,
+      message: ELIGIBILITY_RESULT_ALREADY_EXISTS_MESSAGE,
+      publicMessage: ELIGIBILITY_RESULT_ALREADY_EXISTS_MESSAGE,
+    });
+    expect((thrown as Error).cause).toBeUndefined();
+    expect(fixture.writes).toHaveLength(2);
+    expectSanitized(fixture.writes[1]);
+  });
+
+  it('does not classify a near-match SDK cause that contains private diagnostics', async () => {
+    const compactCause = Object.assign(
+      new Error('failed assert: Eligibility result already exists secretPin=do-not-reflect'),
+      { name: 'CompactError' },
+    );
+    const sdkWrapper = new Error('Unexpected scoped transaction failure containing private diagnostics', {
+      cause: compactCause,
+    });
+    const fixture = createFixture({ circuitFailure: sdkWrapper });
+
+    await expect(
+      api.verifyEligibility(
+        fixture.contract,
+        fixture.providers,
+        2n,
+        'SELLER',
+        500_000_000n,
+        20_000n,
+        1n,
+        4321n,
+        POLICY_REQUEST,
+        'http://127.0.0.1:4000',
+        fixture.authorize,
+      ),
+    ).rejects.toBe(sdkWrapper);
+
+    expect(fixture.writes).toHaveLength(2);
+    expectSanitized(fixture.writes[1]);
   });
 
   it('attempts cleanup when the witness write persists data and then rejects', async () => {
@@ -274,6 +382,7 @@ describe('split eligibility proof lifecycle', () => {
         20_000n,
         1n,
         9876n,
+        POLICY_REQUEST,
         'http://127.0.0.1:4000',
         fixture.authorize,
       ),
@@ -298,6 +407,7 @@ describe('split eligibility proof lifecycle', () => {
       20_001n,
       2n,
       2468n,
+      POLICY_REQUEST,
       'http://127.0.0.1:4000',
       fixture.authorize,
     );
@@ -320,6 +430,7 @@ describe('split eligibility proof lifecycle', () => {
       20_000n,
       1n,
       1234n,
+      POLICY_REQUEST,
       'http://127.0.0.1:4000',
     );
     fixture.setState(getInitialPrivateState(new Uint8Array(32).fill(8)));

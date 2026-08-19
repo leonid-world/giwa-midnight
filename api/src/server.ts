@@ -5,17 +5,19 @@ import {
   jsonBodyRequired,
   PublicApiError,
   requestBodyTooLarge,
+  proofResultExpired,
 } from './errors.js';
 import { NETWORK_ID } from './config.js';
 import type { GetEligibilityResult } from './eligibility.js';
 import type { EligibilityResolutionJson, ErrorJson } from './types.js';
 
-const RESOLVE_PATH = '/v1/eligibility-results/resolve';
+const RESOLVE_PATH = '/v2/eligibility-results/resolve';
 const MAX_JSON_BODY_BYTES = 4_096;
 
 export interface ApiServerDependencies {
   readonly getEligibilityResult: GetEligibilityResult;
   readonly approvedContractAddress: string;
+  readonly nowSeconds?: () => bigint;
 }
 
 function sendJson(response: ServerResponse, status: number, body: unknown): void {
@@ -39,14 +41,6 @@ function sendError(response: ServerResponse, error: PublicApiError): void {
   sendJson(response, error.status, body);
 }
 
-function pathnameOf(request: IncomingMessage): string {
-  try {
-    return new URL(request.url ?? '/', 'http://127.0.0.1').pathname;
-  } catch {
-    return '/';
-  }
-}
-
 function requireJsonContentType(request: IncomingMessage): void {
   const contentType = request.headers['content-type'];
   if (
@@ -57,12 +51,18 @@ function requireJsonContentType(request: IncomingMessage): void {
   }
 }
 
+function requireUncompressedBody(request: IncomingMessage): void {
+  const encoding = request.headers['content-encoding'];
+  if (encoding !== undefined && encoding.toLowerCase() !== 'identity') {
+    throw new PublicApiError(415, 'UNSUPPORTED_CONTENT_ENCODING', 'Compressed request bodies are not supported.');
+  }
+}
+
 async function readJsonBody(request: IncomingMessage): Promise<unknown> {
   const contentLength = request.headers['content-length'];
   if (
     typeof contentLength === 'string' &&
-    /^\d+$/.test(contentLength) &&
-    Number(contentLength) > MAX_JSON_BODY_BYTES
+    (!/^(0|[1-9][0-9]*)$/.test(contentLength) || BigInt(contentLength) > BigInt(MAX_JSON_BODY_BYTES))
   ) {
     request.resume();
     throw requestBodyTooLarge();
@@ -87,9 +87,13 @@ async function readJsonBody(request: IncomingMessage): Promise<unknown> {
   }
 }
 
-export function createApiServer({ getEligibilityResult, approvedContractAddress }: ApiServerDependencies): Server {
+export function createApiServer({
+  getEligibilityResult,
+  approvedContractAddress,
+  nowSeconds = () => BigInt(Math.floor(Date.now() / 1_000)),
+}: ApiServerDependencies): Server {
   return createHttpServer(async (request, response) => {
-    const pathname = pathnameOf(request);
+    const pathname = request.url ?? '/';
 
     if (pathname === '/health') {
       if (request.method !== 'GET') {
@@ -118,13 +122,29 @@ export function createApiServer({ getEligibilityResult, approvedContractAddress 
 
     try {
       requireJsonContentType(request);
+      requireUncompressedBody(request);
       const requestBody = await readJsonBody(request);
       const verified = verifyProofCapability(requestBody, approvedContractAddress);
+      if (BigInt(verified.capability.validUntil) <= nowSeconds()) {
+        throw proofResultExpired();
+      }
       const result = await getEligibilityResult(
         verified.capability.midnightContractAddress,
         verified.lookupKeyBytes,
       );
+      if (
+        result.profileAsOf !== verified.capability.profileAsOf ||
+        result.validUntil !== verified.capability.validUntil ||
+        result.evaluationVersion !== verified.capability.evaluationVersion
+      ) {
+        throw new PublicApiError(
+          400,
+          'CAPABILITY_RESULT_MISMATCH',
+          'The proof capability freshness metadata does not match the public result.',
+        );
+      }
       const responseBody: EligibilityResolutionJson = {
+        version: 2,
         networkId: NETWORK_ID,
         contractAddress: verified.capability.midnightContractAddress,
         context: {
@@ -133,6 +153,12 @@ export function createApiServer({ getEligibilityResult, approvedContractAddress 
           onchainReceivableId: verified.capability.onchainReceivableId,
           subjectRole: verified.capability.subjectRole,
           partyWallet: verified.capability.partyWallet,
+          requestId: verified.capability.requestId,
+          intendedFunderWallet: verified.capability.intendedFunderWallet,
+          minAnnualRevenueKrw: verified.capability.minAnnualRevenueKrw,
+          maxDebtRatioBps: verified.capability.maxDebtRatioBps,
+          maxOverdueCount: verified.capability.maxOverdueCount,
+          policyRequestHash: verified.capability.policyRequestHash,
         },
         result: {
           lookupKey: verified.capability.lookupKey,
